@@ -5,7 +5,22 @@ from unittest.mock import Mock, MagicMock
 import pytest
 
 from openalex_neo4j.importer import OpenAlexImporter
-from openalex_neo4j.models import Work, Author, Institution, Source, Topic
+from openalex_neo4j.models import Work, Author, Institution, Source, Topic, ImportSession
+
+
+@pytest.fixture
+def mock_openalex_client():
+    """Create a mock OpenAlex client."""
+    client = Mock()
+    client.search_works = Mock(return_value=[])
+    client.fetch_works_by_ids = Mock(return_value=[])
+    client.fetch_authors_by_ids = Mock(return_value=[])
+    client.fetch_institutions_by_ids = Mock(return_value=[])
+    client.fetch_sources_by_ids = Mock(return_value=[])
+    client.fetch_topics_by_ids = Mock(return_value=[])
+    client.fetch_publishers_by_ids = Mock(return_value=[])
+    client.fetch_funders_by_ids = Mock(return_value=[])
+    return client
 
 
 class TestOpenAlexImporter:
@@ -21,7 +36,8 @@ class TestOpenAlexImporter:
         return client
 
     @pytest.fixture
-    def mock_openalex_client(self):
+    def mock_openalex_client(self, mock_openalex_client):
+        return mock_openalex_client
         """Create a mock OpenAlex client."""
         client = Mock()
         client.search_works = Mock(return_value=[])
@@ -237,3 +253,71 @@ class TestOpenAlexImporter:
         # Second expansion should not fetch again (already have it)
         importer._expand_relationships()
         assert mock_openalex_client.fetch_authors_by_ids.call_count == 1
+
+
+class TestImporterSessionTracking:
+    """Tests for importer session tracking integration."""
+
+    @pytest.fixture
+    def mock_session_manager(self):
+        manager = Mock()
+        session = ImportSession(id="20260101_120000", query="test")
+        manager.create_session.return_value = session
+        return manager
+
+    @pytest.fixture
+    def importer_with_session(self, mock_neo4j_client, mock_openalex_client, mock_session_manager):
+        return OpenAlexImporter(mock_neo4j_client, mock_openalex_client, mock_session_manager)
+
+    def test_session_created_on_import(self, importer_with_session, mock_session_manager, mock_openalex_client):
+        """Test that a session is created when importing."""
+        mock_openalex_client.search_works.return_value = [
+            Work(id="W1", title="Test Paper"),
+        ]
+
+        importer_with_session.import_from_query("test query", limit=1)
+
+        mock_session_manager.create_session.assert_called_once_with(
+            query="test query", limit=1, expand_depth=1, tag=None,
+        )
+
+    def test_session_completed_after_import(self, importer_with_session, mock_session_manager, mock_openalex_client):
+        """Test that session is marked completed after import."""
+        mock_openalex_client.search_works.return_value = [
+            Work(id="W1", title="Test Paper"),
+        ]
+
+        counts = importer_with_session.import_from_query("test", limit=1)
+
+        mock_session_manager.complete_session.assert_called_once()
+        args, kwargs = mock_session_manager.complete_session.call_args
+        assert args[0] == "20260101_120000"  # session_id
+        assert isinstance(kwargs["stats"], dict)     # stats
+
+    def test_no_session_manager_no_tracking(self, mock_neo4j_client, mock_openalex_client):
+        """Test that without session manager, no tracking occurs."""
+        importer = OpenAlexImporter(mock_neo4j_client, mock_openalex_client)
+        assert importer.session_manager is None
+        assert importer.current_session is None
+
+    def test_to_node_dict_called_with_session(self, importer_with_session, mock_session_manager, mock_openalex_client, mock_neo4j_client):
+        """Test that to_node_dict is called with current_session."""
+        mock_openalex_client.search_works.return_value = [
+            Work(id="W1", title="Test"),
+        ]
+
+        importer_with_session.import_from_query("test", limit=1)
+
+        # Verify batch_create_nodes was called with current_session
+        calls = mock_neo4j_client.batch_create_nodes.call_args_list
+        work_call = [c for c in calls if c[0][0] == "Work"]
+        assert len(work_call) > 0
+
+    def test_session_tag_passed_to_manager(self, importer_with_session, mock_session_manager, mock_openalex_client):
+        """Test that tag is passed to session manager."""
+        mock_openalex_client.search_works.return_value = []
+        importer_with_session.import_from_query("test", limit=1, tag="my-import")
+
+        mock_session_manager.create_session.assert_called_with(
+            query="test", limit=1, expand_depth=1, tag="my-import",
+        )

@@ -4,6 +4,7 @@ import pytest
 
 from openalex_neo4j.models import (
     extract_openalex_id,
+    ImportSession,
     Work,
     Author,
     Institution,
@@ -274,3 +275,130 @@ class TestFunder:
         assert funder.id == "F123"
         assert funder.display_name == "NSF"
         assert funder.country_code == "US"
+
+
+class TestImportSession:
+    """Tests for ImportSession model."""
+
+    def test_to_node_dict_minimal(self):
+        """Test ImportSession to_node_dict with minimal fields."""
+        session = ImportSession(
+            id="20260505_120000",
+            query="machine learning",
+        )
+        node_dict = session.to_node_dict()
+        assert node_dict["id"] == "20260505_120000"
+        assert node_dict["query"] == "machine learning"
+        assert node_dict["status"] == "completed"
+        assert "created_at" in node_dict
+
+    def test_to_node_dict_with_datetime(self):
+        """Test ImportSession to_node_dict with datetime."""
+        from datetime import datetime
+        session = ImportSession(
+            id="20260505_120000",
+            query="test",
+            created_at=datetime(2026, 5, 5, 12, 0, 0),
+        )
+        node_dict = session.to_node_dict()
+        assert node_dict["created_at"] == "2026-05-05T12:00:00"
+
+    def test_to_node_dict_excludes_stats(self):
+        """Test that stats and quality_summary are excluded from node dict."""
+        session = ImportSession(
+            id="20260505_120000", query="test",
+            stats={"works": 10}, quality_summary={"errors": 1},
+        )
+        node_dict = session.to_node_dict()
+        assert "stats" not in node_dict
+        assert "quality_summary" not in node_dict
+
+
+class TestWorkSessionTracking:
+    """Tests for Work session tracking fields."""
+
+    def test_to_node_dict_without_session(self):
+        """Test to_node_dict returns original format when no session given."""
+        work = Work(id="W1", title="Test")
+        node_dict = work.to_node_dict()
+        assert "import_sessions" not in node_dict
+        assert "first_imported_at" not in node_dict
+
+    def test_to_node_dict_with_session(self):
+        """Test to_node_dict includes session fields when session given."""
+        work = Work(id="W1", title="Test", import_sessions=["20260505_120000"])
+        node_dict = work.to_node_dict(current_session="20260505_120000")
+        assert node_dict["import_sessions"] == ["20260505_120000"]
+        assert "first_imported_at" in node_dict
+
+    def test_to_node_dict_embedding_preserved(self):
+        """Test embedding field still works with session tracking."""
+        work = Work(id="W1", title="Test", embedding=[0.1, 0.2])
+        node_dict = work.to_node_dict(current_session="S1")
+        assert node_dict["embedding"] == [0.1, 0.2]
+        assert node_dict["import_sessions"] == ["S1"]
+
+
+class TestAuthorSessionTracking:
+    """Tests for Author session tracking fields."""
+
+    def test_to_node_dict_without_session(self):
+        author = Author(id="A1", display_name="John Doe")
+        node_dict = author.to_node_dict()
+        assert "import_sessions" not in node_dict
+
+    def test_to_node_dict_with_session(self):
+        author = Author(id="A1", display_name="John Doe")
+        node_dict = author.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]
+        assert "first_imported_at" in node_dict
+
+
+class TestInstitutionSessionTracking:
+    """Tests for Institution session tracking fields."""
+
+    def test_to_node_dict_without_session(self):
+        inst = Institution(id="I1", display_name="MIT")
+        node_dict = inst.to_node_dict()
+        assert "import_sessions" not in node_dict
+
+    def test_to_node_dict_with_session(self):
+        inst = Institution(id="I1", display_name="MIT")
+        node_dict = inst.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]
+
+
+class TestSourceSessionTracking:
+    """Tests for Source session tracking fields."""
+
+    def test_to_node_dict_with_session(self):
+        source = Source(id="S1", display_name="Nature")
+        node_dict = source.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]
+
+
+class TestTopicSessionTracking:
+    """Tests for Topic session tracking fields."""
+
+    def test_to_node_dict_with_session(self):
+        topic = Topic(id="T1", display_name="ML")
+        node_dict = topic.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]
+
+
+class TestPublisherSessionTracking:
+    """Tests for Publisher session tracking fields."""
+
+    def test_to_node_dict_with_session(self):
+        pub = Publisher(id="P1", display_name="Springer")
+        node_dict = pub.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]
+
+
+class TestFunderSessionTracking:
+    """Tests for Funder session tracking fields."""
+
+    def test_to_node_dict_with_session(self):
+        funder = Funder(id="F1", display_name="NSF")
+        node_dict = funder.to_node_dict(current_session="S1")
+        assert node_dict["import_sessions"] == ["S1"]

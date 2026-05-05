@@ -213,7 +213,8 @@ class Neo4jClient:
         label: str,
         nodes: list[dict[str, Any]],
         batch_size: int = 500,
-        dynamic_label: bool = False
+        dynamic_label: bool = False,
+        current_session: str | None = None,
     ) -> int:
         """Create nodes in batches using UNWIND and MERGE.
 
@@ -223,6 +224,13 @@ class Neo4jClient:
             batch_size: Number of nodes per batch
             dynamic_label: If True, use item._label field from node dict as additional
                 dynamic label using Neo4j's dynamic label syntax: SET n:$(item._label)
+            current_session: If provided, enables session tracking.
+                Each node dict should include:
+                  - current_session: session ID
+                  - current_timestamp: ISO timestamp string
+                  - import_sessions: list[str]
+                  - first_imported_at: str or None
+                  - last_imported_at: str or None
 
         Returns:
             Total number of nodes created/updated
@@ -233,23 +241,68 @@ class Neo4jClient:
         logger.info(f"Creating {len(nodes)} {label} nodes in batches of {batch_size}")
         total_created = 0
 
-        # Build query with optional dynamic label using SET n:$(expr) syntax
-        if dynamic_label:
-            query = f"""
-            UNWIND $batch AS item
-            MERGE (n:{label} {{id: item.id}})
-            SET n += item {{.*, _label: null}},
-                n:$(item._label)
-            RETURN count(n) as count
-            """
-            logger.debug("Using dynamic labels from _label field")
+        if current_session and label != "ImportSession":
+            # With session tracking: use ON CREATE / ON MATCH to merge import_sessions
+            if dynamic_label:
+                query = f"""
+                UNWIND $batch AS item
+                MERGE (n:{label} {{id: item.id}})
+                ON CREATE SET
+                  n += item {{.*, _label: null, current_session: null, current_timestamp: null,
+                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                  n.import_sessions = [item.current_session],
+                  n.first_imported_at = item.current_timestamp,
+                  n.last_imported_at = item.current_timestamp
+                ON MATCH SET
+                  n += item {{.*, _label: null, current_session: null, current_timestamp: null,
+                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                  n.import_sessions =
+                    CASE WHEN item.current_session IN coalesce(n.import_sessions, [])
+                    THEN n.import_sessions
+                    ELSE coalesce(n.import_sessions, []) + item.current_session
+                    END,
+                  n.last_imported_at = item.current_timestamp
+                SET n:$(item._label)
+                RETURN count(n) as count
+                """
+            else:
+                query = f"""
+                UNWIND $batch AS item
+                MERGE (n:{label} {{id: item.id}})
+                ON CREATE SET
+                  n += item {{.*, current_session: null, current_timestamp: null,
+                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                  n.import_sessions = [item.current_session],
+                  n.first_imported_at = item.current_timestamp,
+                  n.last_imported_at = item.current_timestamp
+                ON MATCH SET
+                  n += item {{.*, current_session: null, current_timestamp: null,
+                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                  n.import_sessions =
+                    CASE WHEN item.current_session IN coalesce(n.import_sessions, [])
+                    THEN n.import_sessions
+                    ELSE coalesce(n.import_sessions, []) + item.current_session
+                    END,
+                  n.last_imported_at = item.current_timestamp
+                RETURN count(n) as count
+                """
         else:
-            query = f"""
-            UNWIND $batch AS item
-            MERGE (n:{label} {{id: item.id}})
-            SET n += item
-            RETURN count(n) as count
-            """
+            # Original behavior (no session tracking)
+            if dynamic_label:
+                query = f"""
+                UNWIND $batch AS item
+                MERGE (n:{label} {{id: item.id}})
+                SET n += item {{.*, _label: null}},
+                    n:$(item._label)
+                RETURN count(n) as count
+                """
+            else:
+                query = f"""
+                UNWIND $batch AS item
+                MERGE (n:{label} {{id: item.id}})
+                SET n += item
+                RETURN count(n) as count
+                """
 
         with self.driver.session() as session:
             for i in range(0, len(nodes), batch_size):

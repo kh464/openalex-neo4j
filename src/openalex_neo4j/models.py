@@ -1,7 +1,37 @@
 """Data models for OpenAlex entities."""
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+
+
+@dataclass
+class ImportSession:
+    """Represents a single import session (one run of import command)."""
+    id: str
+    query: str
+    limit: int = 100
+    expand_depth: int = 1
+    tag: str | None = None
+    created_at: datetime | None = None
+    status: str = "completed"                 # "completed" | "failed" | "running"
+    stats: dict[str, int] | None = None       # node/relationship counts from the import
+    quality_summary: dict | None = None        # {"errors": N, "warnings": N, "infos": N}
+
+    def to_node_dict(self) -> dict[str, Any]:
+        """Convert to Neo4j node properties.
+
+        Omits stats/quality_summary (stored in local JSON only).
+        """
+        return {
+            "id": self.id,
+            "query": self.query,
+            "limit": self.limit,
+            "expand_depth": self.expand_depth,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "status": self.status,
+            "tag": self.tag,
+        }
 
 
 def extract_openalex_id(url: str | None) -> str | None:
@@ -39,6 +69,10 @@ class Work:
     topic_ids: list[str] = field(default_factory=list)
     funder_ids: list[str] = field(default_factory=list)
     referenced_work_ids: list[str] = field(default_factory=list)
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Work":
@@ -139,8 +173,12 @@ class Work:
             referenced_work_ids=referenced_work_ids,
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for Neo4j node creation."""
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
+        """Convert to dictionary for Neo4j node creation.
+
+        Args:
+            current_session: If provided, include session tracking fields.
+        """
         from .neo4j_client import to_camel_case_label
 
         node_dict = {
@@ -162,6 +200,11 @@ class Work:
         # Only include embedding if it exists
         if self.embedding:
             node_dict["embedding"] = self.embedding
+        # Session tracking fields
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
         return node_dict
 
 
@@ -173,6 +216,10 @@ class Author:
     orcid: str | None = None
     works_count: int = 0
     cited_by_count: int = 0
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Author":
@@ -189,15 +236,20 @@ class Author:
             cited_by_count=data.get("cited_by_count", 0),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "orcid": self.orcid,
             "works_count": self.works_count,
             "cited_by_count": self.cited_by_count,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict
 
 
 @dataclass
@@ -209,6 +261,10 @@ class Institution:
     country_code: str | None = None
     type: str | None = None
     works_count: int = 0
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Institution":
@@ -226,9 +282,9 @@ class Institution:
             works_count=data.get("works_count", 0),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "ror": self.ror,
@@ -236,6 +292,11 @@ class Institution:
             "type": self.type,
             "works_count": self.works_count,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict
 
 
 @dataclass
@@ -248,6 +309,10 @@ class Source:
     type: str | None = None
     publisher_id: str | None = None
     works_count: int = 0
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Source":
@@ -270,9 +335,9 @@ class Source:
             works_count=data.get("works_count", 0),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "issn_l": self.issn_l,
@@ -280,6 +345,11 @@ class Source:
             "type": self.type,
             "works_count": self.works_count,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict
 
 
 @dataclass
@@ -289,6 +359,10 @@ class Topic:
     display_name: str | None = None
     description: str | None = None
     keywords: list[str] = field(default_factory=list)
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Topic":
@@ -304,14 +378,19 @@ class Topic:
             keywords=data.get("keywords", []),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "description": self.description,
             "keywords": self.keywords,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict
 
 
 @dataclass
@@ -321,6 +400,10 @@ class Publisher:
     display_name: str | None = None
     country_codes: list[str] = field(default_factory=list)
     works_count: int = 0
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Publisher":
@@ -336,14 +419,19 @@ class Publisher:
             works_count=data.get("works_count", 0),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "country_codes": self.country_codes,
             "works_count": self.works_count,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict
 
 
 @dataclass
@@ -353,6 +441,10 @@ class Funder:
     display_name: str | None = None
     country_code: str | None = None
     description: str | None = None
+    # Session tracking fields
+    import_sessions: list[str] = field(default_factory=list)
+    first_imported_at: str | None = None
+    last_imported_at: str | None = None
 
     @classmethod
     def from_openalex(cls, data: dict[str, Any]) -> "Funder":
@@ -368,11 +460,16 @@ class Funder:
             description=data.get("description"),
         )
 
-    def to_node_dict(self) -> dict[str, Any]:
+    def to_node_dict(self, current_session: str | None = None) -> dict[str, Any]:
         """Convert to dictionary for Neo4j node creation."""
-        return {
+        node_dict = {
             "id": self.id,
             "display_name": self.display_name,
             "country_code": self.country_code,
             "description": self.description,
         }
+        if current_session:
+            node_dict["import_sessions"] = self.import_sessions or [current_session]
+            node_dict["first_imported_at"] = self.first_imported_at
+            node_dict["last_imported_at"] = self.last_imported_at
+        return node_dict

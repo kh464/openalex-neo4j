@@ -7,11 +7,21 @@ import pytest
 from openalex_neo4j.neo4j_client import Neo4jClient
 
 
+@pytest.fixture
+def mock_driver():
+    """Create a mock Neo4j driver."""
+    driver = MagicMock()
+    driver.verify_connectivity = Mock()
+    driver.close = Mock()
+    return driver
+
+
 class TestNeo4jClient:
     """Tests for Neo4jClient."""
 
     @pytest.fixture
-    def mock_driver(self):
+    def mock_driver(self, mock_driver):
+        return mock_driver
         """Create a mock Neo4j driver."""
         driver = Mock()
         driver.verify_connectivity = Mock()
@@ -160,3 +170,82 @@ class TestNeo4jClient:
 
         count = client.get_relationship_count("AUTHORED")
         assert count == 100
+
+
+class TestBatchCreateNodesWithSession:
+    """Tests for batch_create_nodes with session tracking."""
+
+    @pytest.fixture
+    def mock_session(self):
+        session = MagicMock()
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"count": 1}
+        session.run.return_value = mock_result
+        return session
+
+    @pytest.fixture
+    def client_with_session(self, mock_driver, mock_session):
+        client = Neo4jClient("bolt://localhost", "neo4j", "password")
+        client._driver = mock_driver
+        mock_driver.session.return_value.__enter__.return_value = mock_session
+        return client
+
+    def test_session_query_contains_import_sessions(self, client_with_session, mock_driver, mock_session):
+        """Test that session tracking mode uses ON CREATE/ON MATCH with import_sessions."""
+        nodes = [{
+            "id": "W1",
+            "title": "Test",
+            "current_session": "S1",
+            "current_timestamp": "2026-01-01T00:00:00",
+            "import_sessions": ["S1"],
+        }]
+        client_with_session.batch_create_nodes("Work", nodes, current_session="S1")
+
+        # Verify the query contains ON CREATE and ON MATCH clauses
+        call_args = mock_session.run.call_args
+        assert call_args is not None
+        query = call_args[0][0]
+        assert "ON CREATE SET" in query
+        assert "ON MATCH SET" in query
+        assert "import_sessions" in query
+        assert "last_imported_at" in query
+
+    def test_session_query_with_dynamic_label(self, client_with_session, mock_session):
+        """Test that dynamic_label works with session tracking."""
+        nodes = [{
+            "id": "W1",
+            "title": "Test",
+            "_label": "Article",
+            "current_session": "S1",
+            "current_timestamp": "2026-01-01T00:00:00",
+            "import_sessions": ["S1"],
+        }]
+        client_with_session.batch_create_nodes("Work", nodes, dynamic_label=True, current_session="S1")
+
+        call_args = mock_session.run.call_args
+        query = call_args[0][0]
+        assert "n:$(item._label)" in query
+
+    def test_no_session_original_behavior(self, client_with_session, mock_session):
+        """Test that without current_session, original query is used."""
+        nodes = [{"id": "W1", "title": "Test"}]
+        client_with_session.batch_create_nodes("Work", nodes)
+
+        call_args = mock_session.run.call_args
+        query = call_args[0][0]
+        assert "ON CREATE SET" not in query
+        assert "SET n += item" in query or "SET n:$(item._label)" in query
+
+    def test_empty_nodes(self, client_with_session):
+        """Test with empty nodes list."""
+        result = client_with_session.batch_create_nodes("Work", [], current_session="S1")
+        assert result == 0
+
+    def test_import_session_label_skips_tracking(self, client_with_session, mock_session):
+        """Test that ImportSession nodes don't get session tracking applied."""
+        nodes = [{"id": "S1", "query": "test"}]
+        client_with_session.batch_create_nodes("ImportSession", nodes, current_session="S1")
+
+        call_args = mock_session.run.call_args
+        query = call_args[0][0]
+        assert "ON CREATE SET" not in query

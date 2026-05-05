@@ -2,11 +2,13 @@
 
 import logging
 from collections import defaultdict
+from datetime import datetime
 from typing import Any
 
 from .models import Work, Author, Institution, Source, Topic, Publisher, Funder
 from .neo4j_client import Neo4jClient
 from .openalex_client import OpenAlexClient
+from .session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,15 +16,26 @@ logger = logging.getLogger(__name__)
 class OpenAlexImporter:
     """Orchestrates import of OpenAlex data into Neo4j."""
 
-    def __init__(self, neo4j_client: Neo4jClient, openalex_client: OpenAlexClient):
+    def __init__(
+        self,
+        neo4j_client: Neo4jClient,
+        openalex_client: OpenAlexClient,
+        session_manager: SessionManager | None = None,
+    ):
         """Initialize importer.
 
         Args:
             neo4j_client: Neo4j client instance
             openalex_client: OpenAlex client instance
+            session_manager: Optional session manager for tracking imports.
+                If None, session tracking is disabled.
         """
         self.neo4j = neo4j_client
         self.openalex = openalex_client
+        self.session_manager = session_manager
+
+        # Current session ID, set when import_from_query is called
+        self.current_session: str | None = None
 
         # Storage for collected entities (deduplicated by ID)
         self.works: dict[str, Work] = {}
@@ -39,7 +52,9 @@ class OpenAlexImporter:
         limit: int = 100,
         expand_depth: int = 1,
         skip_abstracts: bool = False,
-        generate_embeddings: bool = False
+        generate_embeddings: bool = False,
+        tag: str | None = None,
+        skip_constraints: bool = False,
     ) -> dict[str, int]:
         """Import data starting from a search query.
 
@@ -52,6 +67,8 @@ class OpenAlexImporter:
             skip_abstracts: If True, don't store abstracts (faster import)
             generate_embeddings: If True, generate embeddings for semantic search
                 (requires sentence-transformers)
+            tag: Optional human-readable tag for the import session
+            skip_constraints: If True, skip creating constraints and indexes
 
         Returns:
             Dictionary with counts of imported entities
@@ -70,6 +87,17 @@ class OpenAlexImporter:
             logger.info(f"Expanding relationships at depth {depth}")
             self._expand_relationships()
 
+        # Step 2.5: Create import session (if session manager available)
+        if self.session_manager:
+            session_obj = self.session_manager.create_session(
+                query=query,
+                limit=limit,
+                expand_depth=expand_depth,
+                tag=tag,
+            )
+            self.current_session = session_obj.id
+            logger.info(f"Import session: {self.current_session}")
+
         # Step 3: Optionally skip abstracts if not needed
         if skip_abstracts:
             logger.info("Skipping abstracts as requested")
@@ -81,8 +109,9 @@ class OpenAlexImporter:
             self._generate_embeddings()
 
         # Step 5: Create constraints and indexes in Neo4j
-        self.neo4j.create_constraints()
-        self.neo4j.create_indexes(include_vector=generate_embeddings)
+        if not skip_constraints:
+            self.neo4j.create_constraints()
+            self.neo4j.create_indexes(include_vector=generate_embeddings)
 
         # Step 6: Import nodes
         logger.info("Importing nodes to Neo4j")
@@ -94,6 +123,11 @@ class OpenAlexImporter:
 
         # Combine and return counts
         counts = {**node_counts, **rel_counts}
+
+        # Step 7.5: Complete import session
+        if self.session_manager and self.current_session:
+            self.session_manager.complete_session(self.current_session, stats=counts)
+
         logger.info(f"Import complete: {counts}")
         return counts
 
@@ -176,6 +210,22 @@ class OpenAlexImporter:
             for pub in publishers:
                 self.publishers[pub.id] = pub
 
+    def _enrich_nodes_with_session(
+        self, nodes: list[dict[str, Any]], timestamp: str | None = None,
+    ) -> None:
+        """Add current_session and current_timestamp to node dicts for batch_create_nodes.
+
+        The Cypher session-tracking query references item.current_session and
+        item.current_timestamp. These are not added by to_node_dict() so we
+        inject them here.
+        """
+        if not self.current_session:
+            return
+        ts = timestamp or datetime.now().isoformat()
+        for node in nodes:
+            node["current_session"] = self.current_session
+            node["current_timestamp"] = ts
+
     def _import_nodes(self) -> dict[str, int]:
         """Import all collected nodes to Neo4j.
 
@@ -183,47 +233,93 @@ class OpenAlexImporter:
             Dictionary with node counts
         """
         counts = {}
+        ts = datetime.now().isoformat()
 
         # Works (with dynamic type labels)
         if self.works:
-            work_nodes = [w.to_node_dict() for w in self.works.values()]
+            work_nodes = [
+                w.to_node_dict(current_session=self.current_session)
+                for w in self.works.values()
+            ]
+            self._enrich_nodes_with_session(work_nodes, ts)
             counts["works"] = self.neo4j.batch_create_nodes(
-                "Work", work_nodes, type_label_field="type_label"
+                "Work", work_nodes, dynamic_label=True,
+                current_session=self.current_session,
             )
 
         # Authors
         if self.authors:
-            author_nodes = [a.to_node_dict() for a in self.authors.values()]
-            counts["authors"] = self.neo4j.batch_create_nodes("Author", author_nodes)
+            author_nodes = [
+                a.to_node_dict(current_session=self.current_session)
+                for a in self.authors.values()
+            ]
+            self._enrich_nodes_with_session(author_nodes, ts)
+            counts["authors"] = self.neo4j.batch_create_nodes(
+                "Author", author_nodes,
+                current_session=self.current_session,
+            )
 
         # Institutions
         if self.institutions:
-            inst_nodes = [i.to_node_dict() for i in self.institutions.values()]
-            counts["institutions"] = self.neo4j.batch_create_nodes("Institution", inst_nodes)
+            inst_nodes = [
+                i.to_node_dict(current_session=self.current_session)
+                for i in self.institutions.values()
+            ]
+            self._enrich_nodes_with_session(inst_nodes, ts)
+            counts["institutions"] = self.neo4j.batch_create_nodes(
+                "Institution", inst_nodes,
+                current_session=self.current_session,
+            )
 
         # Sources
         if self.sources:
-            source_nodes = [s.to_node_dict() for s in self.sources.values()]
-            counts["sources"] = self.neo4j.batch_create_nodes("Source", source_nodes)
+            source_nodes = [
+                s.to_node_dict(current_session=self.current_session)
+                for s in self.sources.values()
+            ]
+            self._enrich_nodes_with_session(source_nodes, ts)
+            counts["sources"] = self.neo4j.batch_create_nodes(
+                "Source", source_nodes,
+                current_session=self.current_session,
+            )
 
         # Topics
         if self.topics:
-            topic_nodes = [t.to_node_dict() for t in self.topics.values()]
-            counts["topics"] = self.neo4j.batch_create_nodes("Topic", topic_nodes)
+            topic_nodes = [
+                t.to_node_dict(current_session=self.current_session)
+                for t in self.topics.values()
+            ]
+            self._enrich_nodes_with_session(topic_nodes, ts)
+            counts["topics"] = self.neo4j.batch_create_nodes(
+                "Topic", topic_nodes,
+                current_session=self.current_session,
+            )
 
         # Publishers
         if self.publishers:
             pub_nodes = [
-                p.to_node_dict() for p in self.publishers.values()
+                p.to_node_dict(current_session=self.current_session)
+                for p in self.publishers.values()
                 if p is not None  # Filter out placeholders
             ]
+            self._enrich_nodes_with_session(pub_nodes, ts)
             if pub_nodes:
-                counts["publishers"] = self.neo4j.batch_create_nodes("Publisher", pub_nodes)
+                counts["publishers"] = self.neo4j.batch_create_nodes(
+                    "Publisher", pub_nodes,
+                    current_session=self.current_session,
+                )
 
         # Funders
         if self.funders:
-            funder_nodes = [f.to_node_dict() for f in self.funders.values()]
-            counts["funders"] = self.neo4j.batch_create_nodes("Funder", funder_nodes)
+            funder_nodes = [
+                f.to_node_dict(current_session=self.current_session)
+                for f in self.funders.values()
+            ]
+            self._enrich_nodes_with_session(funder_nodes, ts)
+            counts["funders"] = self.neo4j.batch_create_nodes(
+                "Funder", funder_nodes,
+                current_session=self.current_session,
+            )
 
         return counts
 

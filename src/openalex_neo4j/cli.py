@@ -11,6 +11,8 @@ from .neo4j_client import Neo4jClient
 from .openalex_client import OpenAlexClient
 from .importer import OpenAlexImporter
 from .search import HybridSearcher, format_results_table
+from .session_manager import SessionManager
+from .datasource import merge_record
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,6 +29,31 @@ logger = logging.getLogger(__name__)
 def cli():
     """OpenAlex to Neo4j - Import and query scholarly data."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# Helper: shared Neo4j connection
+# ---------------------------------------------------------------------------
+
+def _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password) -> Neo4jClient:
+    """Create and connect a Neo4j client."""
+    client = Neo4jClient(neo4j_uri, neo4j_username, neo4j_password)
+    client.connect()
+    return client
+
+
+def _common_neo4j_options(f):
+    """Decorator adding standard Neo4j connection options to a command."""
+    f = click.option("--neo4j-uri",
+        default=lambda: os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        help="Neo4j connection URI (env: NEO4J_URI)")(f)
+    f = click.option("--neo4j-username",
+        default=lambda: os.getenv("NEO4J_USERNAME", "neo4j"),
+        help="Neo4j username (env: NEO4J_USERNAME)")(f)
+    f = click.option("--neo4j-password",
+        default=lambda: os.getenv("NEO4J_PASSWORD"),
+        help="Neo4j password (env: NEO4J_PASSWORD)")(f)
+    return f
 
 
 @cli.command(name="import")
@@ -82,6 +109,27 @@ def cli():
     is_flag=True,
     help="Enable verbose logging",
 )
+@click.option(
+    "--tag", "-t",
+    default=None,
+    help="Optional tag/alias for this import session",
+)
+@click.option(
+    "--skip-constraints",
+    is_flag=True,
+    help="Skip creating constraints and indexes (faster when Neo4j already set up)",
+)
+@click.option(
+    "--clean",
+    type=click.Choice(["off", "report", "auto"]),
+    default="off",
+    help="Data cleaning level: off (default), report, or auto",
+)
+@click.option(
+    "--quality-report", "--qr",
+    is_flag=True,
+    help="Print quality report after import",
+)
 def import_data(
     query: str,
     limit: int,
@@ -93,6 +141,10 @@ def import_data(
     skip_abstracts: bool,
     generate_embeddings: bool,
     verbose: bool,
+    tag: str | None,
+    skip_constraints: bool,
+    clean: str,
+    quality_report: bool,
 ) -> None:
     """Import OpenAlex scholarly data into Neo4j.
 
@@ -147,13 +199,81 @@ def import_data(
         click.echo("Starting import...")
         click.echo()
 
-        # Create importer and run
-        importer = OpenAlexImporter(neo4j_client, openalex_client)
+        # Initialize session manager for tracking
+        session_manager = SessionManager(neo4j_client)
+
+        # Create importer with session tracking
+        importer = OpenAlexImporter(neo4j_client, openalex_client, session_manager=session_manager)
         counts = importer.import_from_query(
             query, limit, expand_depth,
             skip_abstracts=skip_abstracts,
-            generate_embeddings=generate_embeddings
+            generate_embeddings=generate_embeddings,
+            tag=tag,
+            skip_constraints=skip_constraints,
         )
+
+        # Quality check and cleaning
+        if clean != "off" or quality_report:
+            from .data_quality import DataQualityPipeline, clean_entity_fields
+
+            pipeline = DataQualityPipeline()
+
+            # Build entities dict from importer collections
+            entities = {}
+            if importer.works:
+                entities["Work"] = list(importer.works.values())
+            if importer.authors:
+                entities["Author"] = list(importer.authors.values())
+            if importer.institutions:
+                entities["Institution"] = list(importer.institutions.values())
+            if importer.sources:
+                entities["Source"] = list(importer.sources.values())
+            if importer.topics:
+                entities["Topic"] = list(importer.topics.values())
+
+            # Auto-clean if requested
+            if clean == "auto":
+                total_changes = 0
+                for entity_list in entities.values():
+                    for entity in entity_list:
+                        changes = clean_entity_fields(entity)
+                        total_changes += len(changes)
+                if total_changes > 0:
+                    click.echo(f"Auto-cleaned {total_changes} fields")
+
+            # Run quality check
+            report = pipeline.run(
+                importer.current_session or "unknown",
+                entities,
+            )
+
+            # Store quality summary in session
+            if importer.session_manager and importer.current_session:
+                importer.session_manager.complete_session(
+                    importer.current_session,
+                    stats=counts,
+                    quality_summary=report.summary,
+                )
+
+            # Print summary if requested
+            if quality_report:
+                click.echo()
+                click.echo("=" * 70)
+                click.echo("Quality Report")
+                click.echo("=" * 70)
+                click.echo(f"  Total entities checked: {report.total_entities}")
+                click.echo(f"  Errors:   {report.error_count}")
+                click.echo(f"  Warnings: {report.warning_count}")
+                click.echo(f"  Infos:    {report.info_count}")
+                if report.violations:
+                    click.echo()
+                    click.echo("  Top violations:")
+                    for v in report.violations[:10]:
+                        click.echo(f"    [{v.severity.upper()}] {v.entity_type}:{v.entity_id} - {v.message}")
+                    if len(report.violations) > 10:
+                        click.echo(f"    ... and {len(report.violations) - 10} more")
+                click.echo("=" * 70)
+                click.echo()
 
         # Display results
         click.echo()
@@ -179,6 +299,12 @@ def import_data(
         click.echo(f"  FUNDED_BY: {counts.get('funded_by', 0)}")
         click.echo(f"  PUBLISHED_BY: {counts.get('published_by', 0)}")
         click.echo("=" * 70)
+
+        # Display session ID
+        if importer.current_session:
+            click.echo()
+            click.echo(f"Session ID: {importer.current_session}")
+            click.echo(f"Use 'openalex-neo4j session show {importer.current_session}' for details")
 
         # Clean up
         neo4j_client.close()
@@ -338,6 +464,520 @@ def search(
 def main():
     """Entry point for CLI - redirects to group."""
     cli()
+
+
+# ---------------------------------------------------------------------------
+# clear command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="clear")
+@_common_neo4j_options
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def clear_data(neo4j_uri, neo4j_username, neo4j_password, yes):
+    """Clear ALL data from the Neo4j database.
+
+    WARNING: This will permanently delete all nodes and relationships.
+    """
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    if not yes:
+        click.echo()
+        click.echo("!" * 70)
+        click.echo("WARNING: This will permanently delete ALL data in the database!")
+        click.echo("!" * 70)
+        click.echo()
+        click.confirm("Are you sure you want to continue?", abort=True)
+
+    click.echo("Connecting to Neo4j...")
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+
+    click.echo("Clearing database...")
+    neo4j_client.clear_database()
+    neo4j_client.close()
+
+    # Also clear local session metadata so `sessions` doesn't show stale entries
+    from .session_manager import SessionManager
+    manager = SessionManager(neo4j_client=None)  # type: ignore[arg-type]
+    manager.clear_all_sessions()
+
+    click.echo("Database cleared successfully.")
+
+
+# ---------------------------------------------------------------------------
+# stats command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="stats")
+@_common_neo4j_options
+def stats_command(neo4j_uri, neo4j_username, neo4j_password):
+    """Show statistics about imported data in the Neo4j database."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+
+    click.echo("=" * 70)
+    click.echo("Database Statistics")
+    click.echo("=" * 70)
+
+    labels = ["Work", "Author", "Institution", "Source", "Topic", "Publisher", "Funder", "ImportSession"]
+    for label in labels:
+        try:
+            count = neo4j_client.get_node_count(label)
+            click.echo(f"  {label}: {count}")
+        except Exception:
+            click.echo(f"  {label}: (error)")
+
+    click.echo()
+    click.echo("Relationships:")
+    rels = ["AUTHORED", "AFFILIATED_WITH", "PUBLISHED_IN", "CITES", "HAS_TOPIC", "FUNDED_BY", "PUBLISHED_BY"]
+    for rel in rels:
+        try:
+            count = neo4j_client.get_relationship_count(rel)
+            click.echo(f"  {rel}: {count}")
+        except Exception:
+            click.echo(f"  {rel}: (error)")
+
+    click.echo("=" * 70)
+    neo4j_client.close()
+
+
+# ---------------------------------------------------------------------------
+# session group
+# ---------------------------------------------------------------------------
+
+@cli.group(name="session")
+def session_group():
+    """Manage import sessions."""
+    pass
+
+
+@session_group.command(name="list")
+@_common_neo4j_options
+@click.option("--limit", default=20, type=int, help="Number of sessions to show")
+def session_list(neo4j_uri, neo4j_username, neo4j_password, limit):
+    """List all import sessions."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+    sessions = manager.list_sessions(limit=limit)
+
+    if not sessions:
+        click.echo("No import sessions found.")
+        neo4j_client.close()
+        return
+
+    click.echo("-" * 90)
+    click.echo(f"{'Session ID':<20} {'Query':<30} {'Status':<12} {'Stats':<20}")
+    click.echo("-" * 90)
+    for s in sessions:
+        stats_str = ""
+        if s.stats:
+            stats_str = f"works={s.stats.get('works', 0)}"
+        tag_str = f" [{s.tag}]" if s.tag else ""
+        click.echo(
+            f"{s.id:<20} {s.query[:28]:<30} {s.status:<12} {stats_str:<20}"
+            f"{tag_str}"
+        )
+    click.echo("-" * 90)
+
+    neo4j_client.close()
+
+
+@session_group.command(name="show")
+@_common_neo4j_options
+@click.argument("session_id")
+def session_show(neo4j_uri, neo4j_username, neo4j_password, session_id):
+    """Show details for a specific import session."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+    session = manager.get_session(session_id)
+
+    if not session:
+        click.echo(f"Session '{session_id}' not found.", err=True)
+        neo4j_client.close()
+        sys.exit(1)
+
+    click.echo("=" * 70)
+    click.echo(f"Session: {session.id}")
+    click.echo("=" * 70)
+    click.echo(f"  Query:         {session.query}")
+    click.echo(f"  Status:        {session.status}")
+    click.echo(f"  Limit:         {session.limit}")
+    click.echo(f"  Expand depth:  {session.expand_depth}")
+    click.echo(f"  Tag:           {session.tag or '(none)'}")
+    click.echo(f"  Created at:    {session.created_at}")
+    if session.stats:
+        click.echo()
+        click.echo("  Import Stats:")
+        for key, val in sorted(session.stats.items()):
+            click.echo(f"    {key}: {val}")
+
+    # Query current node counts for this session
+    click.echo()
+    click.echo("  Current nodes in this session (from graph):")
+    try:
+        node_counts = manager.get_session_node_counts(session_id)
+        for label, count in sorted(node_counts.items()):
+            click.echo(f"    {label}: {count}")
+    except Exception as e:
+        click.echo(f"    (could not query: {e})")
+
+    click.echo("=" * 70)
+    neo4j_client.close()
+
+
+@session_group.command(name="delete")
+@_common_neo4j_options
+@click.argument("session_id")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def session_delete(neo4j_uri, neo4j_username, neo4j_password, session_id, yes):
+    """Delete all data associated with a session.
+
+    This removes nodes that were exclusively created by this session,
+    and unlinks shared nodes from this session's tracking.
+    """
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    if not yes:
+        click.echo()
+        click.echo(f"WARNING: This will delete all data for session '{session_id}'!")
+        click.echo("This action cannot be undone.")
+        click.echo()
+        click.confirm("Are you sure you want to continue?", abort=True)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+
+    try:
+        result = manager.delete_session(session_id)
+        click.echo(f"Session '{session_id}' deleted.")
+        click.echo(f"  Nodes removed:  {result.get('deleted', 0)}")
+        click.echo(f"  Nodes updated:  {result.get('updated', 0)}")
+    except Exception as e:
+        click.echo(f"Error deleting session: {e}", err=True)
+        sys.exit(1)
+    finally:
+        neo4j_client.close()
+
+
+@session_group.command(name="tag")
+@_common_neo4j_options
+@click.argument("session_id")
+@click.option("--name", required=True, help="Tag name for the session")
+def session_tag(neo4j_uri, neo4j_username, neo4j_password, session_id, name):
+    """Set a human-readable tag for a session."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+
+    try:
+        manager.tag_session(session_id, name)
+        click.echo(f"Session '{session_id}' tagged as '{name}'.")
+    except KeyError:
+        click.echo(f"Session '{session_id}' not found.", err=True)
+        sys.exit(1)
+    finally:
+        neo4j_client.close()
+
+
+# ---------------------------------------------------------------------------
+# sessions shortcut (alias for session list)
+# ---------------------------------------------------------------------------
+
+@cli.command(name="sessions")
+@_common_neo4j_options
+@click.option("--limit", default=20, type=int)
+def sessions_shortcut(neo4j_uri, neo4j_username, neo4j_password, limit):
+    """List all import sessions (shortcut for 'session list')."""
+    ctx = click.get_current_context()
+    ctx.invoke(session_list, neo4j_uri=neo4j_uri, neo4j_username=neo4j_username,
+               neo4j_password=neo4j_password, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# prune command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="prune")
+@_common_neo4j_options
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def prune_data(neo4j_uri, neo4j_username, neo4j_password, yes):
+    """Remove orphaned nodes (no import_sessions or empty import_sessions)."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+
+    # Count orphaned nodes first
+    with neo4j_client.driver.session() as session:
+        result = session.run("""
+            MATCH (n)
+            WHERE n.import_sessions IS NULL
+               OR n.import_sessions = []
+            RETURN labels(n) as label, count(n) as count
+            ORDER BY count DESC
+        """)
+        orphans = {record["label"][0]: record["count"] for record in result}
+
+    if not orphans:
+        click.echo("No orphaned nodes found.")
+        neo4j_client.close()
+        return
+
+    total = sum(orphans.values())
+    click.echo(f"Found {total} orphaned nodes:")
+    for label, count in sorted(orphans.items(), key=lambda x: -x[1]):
+        click.echo(f"  {label}: {count}")
+
+    if not yes:
+        click.echo()
+        click.confirm(f"Delete these {total} nodes?", abort=True)
+
+    with neo4j_client.driver.session() as session:
+        result = session.run("""
+            MATCH (n)
+            WHERE n.import_sessions IS NULL
+               OR n.import_sessions = []
+            DETACH DELETE n
+            RETURN count(n) as deleted
+        """)
+        deleted = result.single()["deleted"]
+
+    click.echo(f"Deleted {deleted} orphaned nodes.")
+    neo4j_client.close()
+
+
+# ---------------------------------------------------------------------------
+# report group
+# ---------------------------------------------------------------------------
+
+@cli.group(name="report")
+def report_group():
+    """View quality reports for import sessions."""
+    pass
+
+
+@report_group.command(name="show")
+@_common_neo4j_options
+@click.argument("session_id")
+def report_show(neo4j_uri, neo4j_username, neo4j_password, session_id):
+    """Show quality report for a session."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+    session = manager.get_session(session_id)
+
+    if not session:
+        click.echo(f"Session '{session_id}' not found.", err=True)
+        neo4j_client.close()
+        sys.exit(1)
+
+    if not session.quality_summary:
+        click.echo(f"No quality report available for session '{session_id}'.")
+        click.echo("Run import with --quality-report or --clean report/auto to generate one.")
+        neo4j_client.close()
+        return
+
+    click.echo("=" * 70)
+    click.echo(f"Quality Report: {session_id}")
+    click.echo("=" * 70)
+    click.echo(f"  Query:     {session.query}")
+    click.echo(f"  Errors:    {session.quality_summary.get('errors', 'N/A')}")
+    click.echo(f"  Warnings:  {session.quality_summary.get('warnings', 'N/A')}")
+    click.echo(f"  Infos:     {session.quality_summary.get('infos', 'N/A')}")
+    click.echo("=" * 70)
+    neo4j_client.close()
+
+
+@report_group.command(name="list")
+@_common_neo4j_options
+@click.option("--limit", default=20, type=int)
+def report_list(neo4j_uri, neo4j_username, neo4j_password, limit):
+    """List sessions that have quality reports."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+    manager = SessionManager(neo4j_client)
+    sessions = manager.list_sessions(limit=limit)
+
+    click.echo("-" * 80)
+    click.echo(f"{'Session ID':<20} {'Errors':<8} {'Warnings':<10} {'Infos':<8}")
+    click.echo("-" * 80)
+
+    count = 0
+    for s in sessions:
+        if s.quality_summary:
+            click.echo(
+                f"{s.id:<20} "
+                f"{s.quality_summary.get('errors', 0):<8} "
+                f"{s.quality_summary.get('warnings', 0):<10} "
+                f"{s.quality_summary.get('infos', 0):<8}"
+            )
+            count += 1
+
+    if count == 0:
+        click.echo("No sessions with quality reports found.")
+    click.echo("-" * 80)
+    neo4j_client.close()
+
+
+# ---------------------------------------------------------------------------
+# enrich command
+# ---------------------------------------------------------------------------
+
+
+@cli.command(name="enrich")
+@_common_neo4j_options
+@click.option("--session", "session_id", help="Session ID to enrich (omit for all works)")
+@click.option("--datasource", "datasource_names", multiple=True,
+              default=["openalex"], help="Data source(s) to use (can repeat, tried in order)")
+@click.option("--strategy", default="fill_null", type=click.Choice(["fill_null", "overwrite"]),
+              help="Merge strategy")
+@click.option("--dry-run", is_flag=True, help="Show what would be enriched without writing")
+@click.option("--limit", default=None, type=int, help="Max works to enrich")
+def enrich_command(neo4j_uri, neo4j_username, neo4j_password,
+                   session_id, datasource_names, strategy, dry_run, limit):
+    """Enrich works with data from additional sources.
+
+    Fills missing fields (abstract, etc.) by querying other data sources.
+    """
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+
+    # Resolve datasources
+    from .datasource import get_datasource, list_datasources
+
+    sources = []
+    for name in datasource_names:
+        try:
+            ds = get_datasource(name)
+            sources.append(ds)
+        except KeyError:
+            click.echo(f"Unknown datasource: '{name}'. Available: {list_datasources()}", err=True)
+            neo4j_client.close()
+            sys.exit(1)
+
+    if not sources:
+        click.echo("No datasources specified.", err=True)
+        neo4j_client.close()
+        sys.exit(1)
+
+    # Find works to enrich
+    with neo4j_client.driver.session() as session:
+        if session_id:
+            result = session.run("""
+                MATCH (w:Work)
+                WHERE $session_id IN w.import_sessions
+                RETURN w.id as id, w.title as title, w.doi as doi
+            """, session_id=session_id)
+        else:
+            result = session.run("""
+                MATCH (w:Work)
+                RETURN w.id as id, w.title as title, w.doi as doi
+            """)
+
+        works = []
+        for record in result:
+            works.append({
+                "id": record["id"],
+                "title": record["title"],
+                "doi": record["doi"],
+            })
+
+    if limit:
+        works = works[:limit]
+
+    if not works:
+        click.echo("No works found to enrich.")
+        neo4j_client.close()
+        return
+
+    click.echo(f"Found {len(works)} works to enrich.")
+    click.echo(f"Data sources: {', '.join(datasource_names)}")
+    click.echo(f"Strategy: {strategy}")
+    if dry_run:
+        click.echo("DRY RUN: no changes will be written.")
+
+    # Enrich each work
+    enriched_count = 0
+    total_changes = 0
+
+    for i, work in enumerate(works):
+        if (i + 1) % 50 == 0:
+            click.echo(f"  Progress: {i + 1}/{len(works)}...")
+
+        # Try each datasource in order until we get a record
+        record = None
+        used_source = None
+        for ds in sources:
+            if work.get("doi"):
+                record = ds.fetch_by_doi(work["doi"])
+                if record:
+                    used_source = ds.name
+                    break
+            if work.get("id"):
+                record = ds.fetch_by_openalex_id(work["id"])
+                if record:
+                    used_source = ds.name
+                    break
+
+        if record is None:
+            continue
+
+        # Merge into a dict of existing properties
+        target = {"title": work.get("title")}
+        changes = merge_record(target, record, strategy=strategy)
+
+        if not changes:
+            continue
+
+        if not dry_run:
+            # Write changes to Neo4j
+            with neo4j_client.driver.session() as ws:
+                for field, (old_val, new_val) in changes.items():
+                    ws.run(
+                        f"MATCH (w:Work {{id: $id}}) SET w.{field} = $val",
+                        id=work["id"], val=new_val,
+                    )
+
+        enriched_count += 1
+        total_changes += len(changes)
+
+        if dry_run:
+            click.echo(f"  [{used_source}] {work['id']}: {len(changes)} fields to update")
+
+    click.echo()
+    if dry_run:
+        click.echo(f"Dry-run complete. Would enrich {enriched_count} works ({total_changes} field changes).")
+    else:
+        click.echo(f"Enriched {enriched_count} works ({total_changes} field changes).")
+
+    neo4j_client.close()
 
 
 if __name__ == "__main__":
