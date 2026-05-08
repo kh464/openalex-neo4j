@@ -1,6 +1,6 @@
 # OpenAlex to Neo4j 导入工具
 
-将 [OpenAlex](https://openalex.org/) 学术数据导入 [Neo4j](https://neo4j.com/) 图数据库的 Python CLI 工具。支持智能混合搜索、导入会话管理、数据质量验证和多数据源富化。
+将 [OpenAlex](https://openalex.org/) 学术数据导入 [Neo4j](https://neo4j.com/) 图数据库的 Python CLI 工具。支持智能混合搜索、导入会话管理、数据质量验证、多数据源富化和本地 WoS 桥接导入。
 
 ## 功能特性
 
@@ -11,12 +11,18 @@
 - 可配置深度的关系扩展（关联作者、机构、来源、主题、出版商、资助方）
 - 可选嵌入向量生成（用于语义搜索）
 - 支持所有主流 OpenAlex 实体类型
+- **本地 JSONL 缓存** — 抓取阶段写入缓存，导入完成自动清理，支持断点恢复
+- **WoS 桥接** — 解析本地 WoS HTML 文件，通过 DOI 回查 OpenAlex 后导入
 
 ### 导入会话管理
 - 每次导入自动生成唯一会话 ID
 - 查看导入历史记录
 - 按会话隔离数据，支持选择性删除
 - 为会话添加可读标签
+
+### OpenAlex 查询统计
+- 查询关键词匹配的文献总数（零数据拉取，1 秒出结果）
+- 支持按年份范围过滤统计
 
 ### 混合搜索
 - **向量相似度搜索** — 基于句子嵌入（all-MiniLM-L6-v2）
@@ -100,65 +106,126 @@ OPENALEX_EMAIL=your.email@example.com
 uv run openalex-neo4j --help
 ```
 
-### 导入数据
+可用命令：
 
-从 OpenAlex 搜索并导入学术数据到 Neo4j：
+| 命令 | 用途 |
+|------|------|
+| `import` | 从 OpenAlex API 搜索并导入数据（支持 `--fetch-only` 仅缓存） |
+| `count` | 查询关键词在 OpenAlex 中的匹配总数 |
+| `search` | 在已导入的 Neo4j 图谱中混合搜索 |
+| `enrich` | 从多数据源富化缺失字段 |
+| `session` / `sessions` | 管理导入会话 |
+| `report` | 查看和汇总质量报告 |
+| `stats` | 查看数据库统计 |
+| `clear` | 清空全部数据 |
+| `prune` | 清理孤立节点 |
+
+---
+
+### import — 从 OpenAlex 导入数据
 
 ```bash
 # 基本导入
 uv run openalex-neo4j import --query "人工智能" --limit 50
 
+# 带时间范围
+uv run openalex-neo4j import --query "量子计算" --from-year 2020 --to-year 2024
+
 # 导入时生成嵌入向量（用于语义搜索）
 uv run openalex-neo4j import \
   --query "机器学习伦理" \
   --limit 100 \
-  --generate-embeddings \
-  --expand-depth 2
+  --generate-embeddings
 
 # 导入时跳过摘要（更快、更省空间）
 uv run openalex-neo4j import --query "量子计算" --limit 50 --skip-abstracts
 
-# 导入后自动运行质量检查
+# 导入后显示质量报告
 uv run openalex-neo4j import --query "自然语言处理" --limit 30 --quality-report
 
-# 导入时清理数据（自动修正空字符串、标准化 DOI、清除异常年份）
-uv run openalex-neo4j import --query "计算机视觉" --limit 30 --clean
+# 导入时自动清洗数据
+uv run openalex-neo4j import --query "计算机视觉" --limit 30 --clean auto
 
 # 为导入会话添加标签
 uv run openalex-neo4j import --query "深度学习" --limit 50 --tag "nlp-2024"
 
-# 跳过约束和索引创建（用于已初始化的数据库）
-uv run openalex-neo4j import --query "数据挖掘" --limit 20 --skip-constraints
+# 仅抓取到本地缓存，不导入 Neo4j（无需 Neo4j 连接）
+uv run openalex-neo4j import --query "regenerative medicine" --limit 100 --from-year 2023 --to-year 2024 --fetch-only
+
+# 保留本地缓存（调试用，默认会自动删除）
+uv run openalex-neo4j import --query "数据挖掘" --limit 20 --keep-cache
+
+# 查看已有缓存会话
+uv run openalex-neo4j import --query dummy --limit 1 --list-cache
+
+# 从缓存恢复导入（跳过 API 抓取，直接写库）
+uv run openalex-neo4j import --resume S20260508_1234_0001
 ```
 
-**导入选项：**
+**import 选项：**
 
-| 选项 | 说明 |
-|------|------|
-| `--query, -q` | OpenAlex 搜索查询（必填） |
-| `--limit, -l` | 最大获取数量（默认: 100） |
-| `--neo4j-uri` | Neo4j 连接地址（环境变量: NEO4J_URI） |
-| `--neo4j-username` | Neo4j 用户名（环境变量: NEO4J_USERNAME） |
-| `--neo4j-password` | Neo4j 密码（环境变量: NEO4J_PASSWORD） |
-| `--email` | OpenAlex polite pool 邮箱（环境变量: OPENALEX_EMAIL） |
-| `--expand-depth` | 关系扩展深度（默认: 1） |
-| `--skip-abstracts` | 跳过摘要存储 |
-| `--generate-embeddings` | 生成嵌入向量（需要安装 embeddings extra） |
-| `--quality-report` | 导入后运行质量检查 |
-| `--clean` | 导入前清理数据 |
-| `--tag` | 为导入会话添加标签 |
-| `--skip-constraints` | 跳过约束和索引创建 |
-| `--verbose, -v` | 启用详细日志 |
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--query, -q` | str | 必填 | OpenAlex 搜索查询 |
+| `--limit, -l` | int | 100 | 最大获取数量 |
+| `--from-year` | int | — | 起始出版年（含） |
+| `--to-year` | int | — | 截止出版年（含） |
+| `--expand-depth` | int | 1 | 关系扩展深度 |
+| `--skip-abstracts` | flag | — | 跳过摘要存储 |
+| `--generate-embeddings` | flag | — | 生成嵌入向量 |
+| `--quality-report` | flag | — | 导入后运行质量检查 |
+| `--clean` | str | off | 数据清洗: off / report / auto |
+| `--tag` | str | — | 导入会话标签 |
+| `--skip-constraints` | flag | — | 跳过约束创建 |
+| `--cache-dir` | path | `~/.openalex-neo4j/cache/` | 本地缓存根目录 |
+| `--keep-cache` | flag | — | 保留缓存不删除 |
+| `--resume` | str | — | 从缓存会话 ID 恢复导入 |
+| `--list-cache` | flag | — | 列出缓存会话 |
+| `--neo4j-uri` | str | env | Neo4j 连接地址 |
+| `--neo4j-username` | str | env | Neo4j 用户名 |
+| `--neo4j-password` | str | env | Neo4j 密码 |
+| `--email` | str | env | OpenAlex polite pool 邮箱 |
+| `--verbose, -v` | flag | — | 详细日志 |
+| `--fetch-only` | flag | — | 仅抓取到本地缓存，跳过 Neo4j 导入 |
 
-### 搜索知识图谱
+---
 
-混合搜索（向量相似度 + 全文搜索）：
+### count — 查询 OpenAlex 匹配总数
+
+不拉取数据，仅返回关键词匹配的文献总数。适合在导入前评估数据规模。
+
+```bash
+# 基本查询
+uv run openalex-neo4j count --query "machine learning"
+# → Matching: 3,932,785
+
+# 按年份过滤
+uv run openalex-neo4j count --query "quantum computing" --from-year 2023 --to-year 2024
+
+# 指定 email（使用 polite pool）
+uv run openalex-neo4j count --query "cancer research" --email user@example.com
+```
+
+**count 选项：**
+
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--query, -q` | str | 必填 | 搜索查询 |
+| `--from-year` | int | — | 起始出版年 |
+| `--to-year` | int | — | 截止出版年 |
+| `--email` | str | env | OpenAlex polite pool 邮箱 |
+
+---
+
+### search — 在图谱中混合搜索
+
+在已导入的 Neo4j 图谱中进行向量 + 全文混合搜索。
 
 ```bash
 # 基本搜索
 uv run openalex-neo4j search --query "神经网络计算机视觉"
 
-# 自定义权重的搜索
+# 自定义权重
 uv run openalex-neo4j search \
   --query "transformer 架构" \
   --limit 20 \
@@ -166,60 +233,31 @@ uv run openalex-neo4j search \
   --fulltext-weight 0.3
 ```
 
-**搜索选项：**
+**search 选项：**
 
-| 选项 | 说明 |
-|------|------|
-| `--query, -q` | 自然语言搜索查询（必填） |
-| `--limit, -l` | 返回结果数（默认: 10） |
-| `--neo4j-uri` | Neo4j 连接地址（环境变量: NEO4J_URI） |
-| `--neo4j-username` | Neo4j 用户名（环境变量: NEO4J_USERNAME） |
-| `--neo4j-password` | Neo4j 密码（环境变量: NEO4J_PASSWORD） |
-| `--vector-weight` | 向量搜索权重 0-1（默认: 0.5） |
-| `--fulltext-weight` | 全文搜索权重 0-1（默认: 0.5） |
-| `--rrf-k` | RRF 常量（默认: 60） |
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--query, -q` | str | 必填 | 自然语言搜索查询 |
+| `--limit, -l` | int | 10 | 返回结果数 |
+| `--vector-weight` | float | 0.5 | 向量搜索权重 0-1 |
+| `--fulltext-weight` | float | 0.5 | 全文搜索权重 0-1 |
+| `--rrf-k` | int | 60 | RRF 常量 |
+| `--neo4j-uri` | str | env | Neo4j 连接地址 |
+| `--neo4j-username` | str | env | Neo4j 用户名 |
+| `--neo4j-password` | str | env | Neo4j 密码 |
 
-### 会话管理
+---
 
-每次导入自动生成唯一会话 ID，你可以管理这些会话：
+### enrich — 多数据源富化
 
-```bash
-# 查看会话列表
-uv run openalex-neo4j sessions
-
-# 或
-uv run openalex-neo4j session list --limit 20
-
-# 查看某个会话详情
-uv run openalex-neo4j session show <session_id>
-
-# 为会话添加标签
-uv run openalex-neo4j session tag <session_id> --name "my-important-import"
-
-# 删除某次导入的数据（仅删除该次导入的独立节点，共享节点保留）
-uv run openalex-neo4j session delete <session_id>
-```
-
-### 质量报告
-
-```bash
-# 查看某次导入的质量报告
-uv run openalex-neo4j report show <session_id>
-
-# 列出有质量报告的会话
-uv run openalex-neo4j report list --limit 20
-```
-
-### 数据富化
-
-从其他数据源（或 OpenAlex 本身）补充缺失字段：
+从其他数据源补充已导入文献的缺失字段。
 
 ```bash
 # 预览富化效果（dry-run，不写入数据库）
 uv run openalex-neo4j enrich --dry-run
 
 # 按会话富化
-uv run openalex-neo4j enrich --session <session_id> --datasource openalex --strategy fill_null
+uv run openalex-neo4j enrich --session S20260508_1234 --datasource openalex --strategy fill_null
 
 # 使用多个数据源按顺序回退
 uv run openalex-neo4j enrich \
@@ -232,30 +270,103 @@ uv run openalex-neo4j enrich \
 uv run openalex-neo4j enrich --limit 50 --dry-run
 ```
 
-### 数据库管理
+**enrich 选项：**
+
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--session` | str | 全部 | 只富化指定会话的数据 |
+| `--datasource` | str | openalex | 数据源（可重复使用） |
+| `--strategy` | str | fill_null | 合并策略: fill_null / overwrite |
+| `--dry-run` | flag | — | 预览不写入 |
+| `--limit` | int | — | 最大处理数 |
+| `--neo4j-uri` | str | env | Neo4j 连接地址 |
+| `--neo4j-username` | str | env | Neo4j 用户名 |
+| `--neo4j-password` | str | env | Neo4j 密码 |
+
+---
+
+### session — 会话管理
+
+每次导入自动生成唯一会话 ID。
 
 ```bash
-# 查看统计数据（各类型节点数和关系数）
+# 列出最近会话
+uv run openalex-neo4j sessions
+uv run openalex-neo4j session list --limit 20
+
+# 查看某个会话详情
+uv run openalex-neo4j session show S20260508_1234_0001
+
+# 为会话添加标签
+uv run openalex-neo4j session tag S20260508_1234_0001 --name "my-important-import"
+
+# 删除某次导入的数据
+# 该会话独有的节点 → 彻底删除；共享节点 → 仅移除会话标记
+uv run openalex-neo4j session delete S20260508_1234_0001
+```
+
+**session 选项：**
+
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--limit` | int | 20 | 列出会话数量（list） |
+| `--tag / --name` | str | 必填 | 会话标签（tag） |
+| `--yes, -y` | flag | — | 跳过确认（delete） |
+| `--neo4j-uri` | str | env | Neo4j 连接地址 |
+| `--neo4j-username` | str | env | Neo4j 用户名 |
+| `--neo4j-password` | str | env | Neo4j 密码 |
+
+---
+
+### report — 质量报告
+
+```bash
+# 查看某次导入的质量报告
+uv run openalex-neo4j report show S20260508_1234_0001
+
+# 列出有质量报告的会话
+uv run openalex-neo4j report list --limit 20
+```
+
+---
+
+### stats / clear / prune — 数据库管理
+
+```bash
+# 查看数据库统计（各类节点和关系数）
 uv run openalex-neo4j stats
 
 # 清除全部数据（需确认）
 uv run openalex-neo4j clear
-
 # 免确认清除
 uv run openalex-neo4j clear --yes
 
-# 清理孤立节点（import_sessions 为 null 或空数组）
+# 清理孤立节点（import_sessions 为空或缺失的节点）
 uv run openalex-neo4j prune
 ```
 
+---
+
 ## 架构
 
-导入流程分为两个阶段：
+### 导入流程
 
-1. **节点创建** — 先使用批量 MERGE 操作创建所有实体节点
-2. **关系创建** — 所有节点创建完成后建立关系
+数据写入分两个阶段：
 
-这种方式确保引用完整性和最佳性能。
+1. **抓取阶段** — 从 OpenAlex API（或 WoS 文件）获取数据，序列化为 JSONL 格式写入本地缓存目录
+2. **导入阶段** — 从本地缓存读取全部实体，批量写入 Neo4j
+
+```
+OpenAlex API / WoS HTML
+       ↓
+  JSONL 本地缓存 (~/.openalex-neo4j/cache/{sid}/)
+       ↓
+  批量 UNWIND + MERGE → Neo4j
+       ↓
+  默认自动删除缓存
+```
+
+支持 `--resume` 从缓存恢复（跳过 API 抓取，直接写库）。
 
 ### 实体类型与关系
 
@@ -335,39 +446,17 @@ merge_record(target, source, strategy)
 
 ## 测试
 
-项目包含单元测试和集成测试：
-
-### 单元测试
+项目包含单元测试和集成测试（188+ 测试用例）：
 
 ```bash
 # 运行所有单元测试
 uv run pytest tests/ -v -m "not integration"
 
-# 带覆盖率运行
+# 带覆盖率
 uv run pytest --cov=openalex_neo4j tests/ -m "not integration"
-```
 
-### 集成测试
-
-```bash
-# 运行所有集成测试（需要 Neo4j + 网络）
-uv run pytest tests/integration/ -v
-
-# Neo4j 集成测试（需要运行中的 Neo4j 实例）
-uv run pytest tests/integration/test_neo4j_integration.py -v
-
-# OpenAlex API 集成测试（需要网络）
-uv run pytest tests/integration/test_openalex_integration.py -v
-
-# 端到端导入测试（需要 Neo4j + 网络）
-uv run pytest tests/integration/test_full_import.py -v
-```
-
-### 全部测试
-
-```bash
+# 运行所有测试
 uv run pytest tests/ -v
-uv run pytest --cov=openalex_neo4j tests/
 ```
 
 ## 项目结构
@@ -375,24 +464,28 @@ uv run pytest --cov=openalex_neo4j tests/
 ```
 openalex-neo4j/
 ├── src/openalex_neo4j/
-│   ├── cli.py                    # CLI 接口
+│   ├── cli.py                    # CLI 入口（11 个命令）
 │   ├── neo4j_client.py           # Neo4j 数据库操作
 │   ├── openalex_client.py        # OpenAlex API 数据获取
 │   ├── models.py                 # 数据模型（7 种实体 + ImportSession）
-│   ├── importer.py               # 导入编排
+│   ├── importer.py               # 导入编排（API + WoS 两条路径）
+│   ├── serializer.py             # DataSerializer — JSONL 序列化/反序列化
 │   ├── session_manager.py        # 导入会话管理
+│   ├── search.py                 # 混合搜索（向量 + 全文 RRF）
 │   ├── data_quality.py           # 数据质量校验和清洗
-│   ├── search.py                 # 混合搜索（向量 + 全文）
+│   ├── embeddings.py             # 嵌入向量生成（可选）
+│   ├── wos_parser.py             # 🚧 WoS HTML 解析器
 │   ├── datasource/
 │   │   ├── __init__.py           # 数据源注册表
-│   │   ├── base.py               # DataSource 抽象基类 + DataRecord + merge_record
+│   │   ├── base.py               # DataSource 抽象基类 + merge_record
 │   │   └── openalex_impl.py      # OpenAlex 数据源适配器
 │   └── neo4j_utils.py            # 工具函数
 ├── tests/
 │   ├── test_cli.py               # CLI 命令测试
+│   ├── test_serializer.py        # JSONL 序列化测试
+│   ├── test_importer.py          # 导入器测试（含缓存模式）
 │   ├── test_neo4j_client.py      # Neo4j 客户端测试
 │   ├── test_openalex_client.py   # OpenAlex 客户端测试
-│   ├── test_importer.py          # 导入器测试
 │   ├── test_models.py            # 数据模型测试
 │   ├── test_session_manager.py   # 会话管理测试
 │   ├── test_data_quality.py      # 数据质量测试
@@ -400,15 +493,10 @@ openalex-neo4j/
 │   ├── test_search.py            # 搜索测试
 │   ├── test_neo4j_utils.py       # 工具函数测试
 │   ├── conftest.py               # 共享测试 Fixture
-│   └── integration/
-│       ├── conftest.py           # 集成测试 Fixture
-│       ├── test_neo4j_integration.py
-│       ├── test_openalex_integration.py
-│       ├── test_full_import.py
-│       └── test_session_integration.py
-└── docs/
-    └── execution/
-        └── data-management.md    # 数据管理功能执行文档
+│   └── integration/              # 集成测试
+├── docs/                         # 设计文档和执行文档
+├── wos/                          # WoS 原始 HTML 数据（示例）
+└── .env.example                  # 环境变量模板
 ```
 
 ## Cypher 查询示例
@@ -463,10 +551,3 @@ MIT
 - [PyAlex 库](https://github.com/J535D165/pyalex)
 - [Neo4j Python 驱动](https://neo4j.com/docs/python-manual/current/)
 - [Cypher 查询语言](https://neo4j.com/docs/cypher-manual/current/)
-
-
-
-一个关键词  共多少篇
-
-是否可以按照时间范围，按照时间范围查询多少篇
-

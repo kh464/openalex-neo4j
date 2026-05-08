@@ -273,3 +273,102 @@ class TestEnrichCommand:
         assert result.exit_code == 0
         # ds2 should have been tried since ds1 returned None
         ds2.fetch_by_openalex_id.assert_called_once_with("W1")
+
+
+# ---------------------------------------------------------------------------
+# import command — cache options
+# ---------------------------------------------------------------------------
+
+class TestImportCacheOptions:
+    """Tests for `openalex-neo4j import --cache-dir / --keep-cache / --resume / --list-cache`."""
+
+    @patch("openalex_neo4j.cli.Neo4jClient")
+    @patch("openalex_neo4j.cli.OpenAlexClient")
+    def test_import_cache_dir_and_keep(
+        self, mock_oa_client_cls, mock_neo4j_cls, runner, tmp_path,
+    ):
+        """--cache-dir and --keep-cache are passed through to the importer."""
+        mock_neo4j_instance = Mock()
+        mock_neo4j_instance.connect = Mock()
+        mock_neo4j_instance.close = Mock()
+        mock_neo4j_cls.return_value = mock_neo4j_instance
+
+        mock_importer = Mock()
+        mock_importer.import_from_query.return_value = {}
+        mock_importer.current_session = "S_test"
+
+        with patch("openalex_neo4j.cli.OpenAlexImporter", return_value=mock_importer):
+            result = runner.invoke(cli, [
+                "import",
+                "--query", "test",
+                "--limit", "1",
+                "--neo4j-password", "pw",
+                "--cache-dir", str(tmp_path),
+                "--keep-cache",
+            ])
+        assert result.exit_code == 0
+        # Check import_from_query was called with the right kwargs
+        _, kwargs = mock_importer.import_from_query.call_args
+        assert "cache_dir" in kwargs
+        assert "keep_cache" in kwargs
+        assert kwargs["keep_cache"] is True
+
+    @patch("openalex_neo4j.cli.Neo4jClient")
+    @patch("openalex_neo4j.cli.OpenAlexClient")
+    def test_import_resume(
+        self, mock_oa_client_cls, mock_neo4j_cls, runner, tmp_path,
+    ):
+        """--resume calls import_from_cache instead of import_from_query."""
+        mock_neo4j_instance = Mock()
+        mock_neo4j_instance.connect = Mock()
+        mock_neo4j_instance.close = Mock()
+        mock_neo4j_cls.return_value = mock_neo4j_instance
+
+        mock_importer = Mock()
+        mock_importer.import_from_cache.return_value = {"works": 5}
+
+        with patch("openalex_neo4j.cli.OpenAlexImporter", return_value=mock_importer):
+            result = runner.invoke(cli, [
+                "import",
+                "--query", "test",
+                "--limit", "1",
+                "--neo4j-password", "pw",
+                "--resume", "S20260508_1200",
+            ])
+        assert result.exit_code == 0
+        mock_importer.import_from_cache.assert_called_once()
+        assert "Resumed import" in result.output
+
+    def test_import_list_cache_no_dir(self, runner, tmp_path):
+        """--list-cache with an empty cache directory."""
+        result = runner.invoke(cli, [
+            "import",
+            "--query", "irrelevant",
+            "--limit", "1",
+            "--neo4j-password", "pw",
+            "--list-cache",
+            "--cache-dir", str(tmp_path),
+        ])
+        assert result.exit_code == 0
+        # Should not crash; the cache dir is empty / non-existent
+
+    def test_import_list_cache_with_data(self, runner, tmp_path):
+        """--list-cache displays cached sessions."""
+        # Create a fake manifest
+        cache_session = tmp_path / "S20260508_1200"
+        cache_session.mkdir(parents=True)
+        manifest = cache_session / "manifest.json"
+        manifest.write_text('{"query": "machine learning", "entity_counts": {"Work": 10}}')
+
+        result = runner.invoke(cli, [
+            "import",
+            "--query", "irrelevant",
+            "--limit", "1",
+            "--neo4j-password", "pw",
+            "--list-cache",
+            "--cache-dir", str(tmp_path),
+        ])
+        assert result.exit_code == 0
+        assert "S20260508_1200" in result.output
+        assert "machine learning" in result.output
+        assert "10" in result.output

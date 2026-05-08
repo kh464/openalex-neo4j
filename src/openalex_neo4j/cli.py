@@ -1,14 +1,17 @@
 """Command-line interface for OpenAlex to Neo4j import tool."""
 
+import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 import click
 from dotenv import load_dotenv
 
 from .neo4j_client import Neo4jClient
 from .openalex_client import OpenAlexClient
+from .rate_limiter import TokenBucket
 from .importer import OpenAlexImporter
 from .search import HybridSearcher, format_results_table
 from .session_manager import SessionManager
@@ -59,14 +62,14 @@ def _common_neo4j_options(f):
 @cli.command(name="import")
 @click.option(
     "--query", "-q",
-    required=True,
-    help="OpenAlex search query (e.g., 'artificial intelligence')",
+    required=False,
+    help="OpenAlex search query (e.g., 'artificial intelligence' — required unless --resume or --list-cache)",
 )
 @click.option(
     "--limit", "-l",
-    default=100,
+    default=None,
     type=int,
-    help="Maximum number of works to fetch (default: 100)",
+    help="Maximum number of works to fetch (default: all matching)",
 )
 @click.option(
     "--neo4j-uri",
@@ -130,9 +133,47 @@ def _common_neo4j_options(f):
     is_flag=True,
     help="Print quality report after import",
 )
+@click.option(
+    "--from-year",
+    type=int,
+    default=None,
+    help="Start publication year (inclusive), e.g. 2020",
+)
+@click.option(
+    "--to-year",
+    type=int,
+    default=None,
+    help="End publication year (inclusive), e.g. 2024",
+)
+@click.option(
+    "--cache-dir",
+    default=None,
+    type=click.Path(file_okay=False),
+    help="Local cache directory (default: ~/.openalex-neo4j/cache/)",
+)
+@click.option(
+    "--keep-cache",
+    is_flag=True,
+    help="Keep local cache after import (for debugging/resume)",
+)
+@click.option(
+    "--resume",
+    default=None,
+    help="Resume import from cached session ID (skips API fetch)",
+)
+@click.option(
+    "--list-cache",
+    is_flag=True,
+    help="List cached import sessions",
+)
+@click.option(
+    "--fetch-only",
+    is_flag=True,
+    help="Only fetch data to local cache, skip Neo4j import",
+)
 def import_data(
     query: str,
-    limit: int,
+    limit: int | None,
     neo4j_uri: str,
     neo4j_username: str,
     neo4j_password: str | None,
@@ -145,6 +186,13 @@ def import_data(
     skip_constraints: bool,
     clean: str,
     quality_report: bool,
+    from_year: int | None,
+    to_year: int | None,
+    cache_dir: str | None,
+    keep_cache: bool,
+    resume: str | None,
+    list_cache: bool,
+    fetch_only: bool,
 ) -> None:
     """Import OpenAlex scholarly data into Neo4j.
 
@@ -157,6 +205,33 @@ def import_data(
         openalex-neo4j import --query "machine learning" --limit 50
 
     """
+
+    def _get_cache_root() -> Path:
+        """Resolve the cache root directory."""
+        return Path(cache_dir) if cache_dir else Path.home() / ".openalex-neo4j" / "cache"
+
+    # Handle --list-cache
+    if list_cache:
+        cache_root = _get_cache_root()
+        if cache_root.exists():
+            for d in sorted(cache_root.iterdir()):
+                if d.is_dir():
+                    manifest_file = d / "manifest.json"
+                    if manifest_file.exists():
+                        m = json.loads(manifest_file.read_text())
+                        click.echo(
+                            f"{d.name}  "
+                            f"query={m.get('query')}  "
+                            f"works={m.get('entity_counts', {}).get('Work', 0)}"
+                        )
+        else:
+            click.echo(f"No cache directory found at {cache_root}")
+        return
+
+    # Handle --resume
+    if resume:
+        click.echo(f"Resuming import from cache session: {resume}")
+
     # Set logging level
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -166,7 +241,11 @@ def import_data(
         click.echo("Error: Neo4j password is required (use --neo4j-password or NEO4J_PASSWORD env var)", err=True)
         sys.exit(1)
 
-    if limit <= 0:
+    if not query and not resume and not list_cache:
+        click.echo("Error: --query is required unless using --resume or --list-cache", err=True)
+        sys.exit(1)
+
+    if limit is not None and limit <= 0:
         click.echo("Error: --limit must be positive", err=True)
         sys.exit(1)
 
@@ -178,23 +257,63 @@ def import_data(
     click.echo("=" * 70)
     click.echo("OpenAlex to Neo4j Import")
     click.echo("=" * 70)
-    click.echo(f"Query: {query}")
-    click.echo(f"Limit: {limit} works")
+    if resume:
+        click.echo(f"Query: (from cache — session {resume})")
+    else:
+        click.echo(f"Query: {query}")
+    click.echo(f"Limit: {'all' if limit is None else limit} works")
+    if from_year:
+        click.echo(f"From year: {from_year}")
+    if to_year:
+        click.echo(f"To year: {to_year}")
     click.echo(f"Expand depth: {expand_depth}")
     click.echo(f"Neo4j URI: {neo4j_uri}")
     click.echo(f"Neo4j username: {neo4j_username}")
     click.echo(f"OpenAlex email: {email or '(not set - using anonymous pool)'}")
+    if keep_cache:
+        click.echo(f"Cache: {_get_cache_root()} (keep)")
+    else:
+        click.echo(f"Cache dir: {_get_cache_root()}")
     click.echo("=" * 70)
     click.echo()
 
     try:
+        # ─── Fetch-only mode: skip Neo4j entirely ───
+        if fetch_only:
+            click.echo("Fetch-only mode: will not write to Neo4j")
+            click.echo()
+            openalex_client = OpenAlexClient(email, rate_limiter=TokenBucket())
+            importer = OpenAlexImporter(None, openalex_client)  # type: ignore[arg-type]
+            counts = importer.import_from_query(
+                query, limit, expand_depth,
+                skip_abstracts=skip_abstracts,
+                generate_embeddings=generate_embeddings,
+                tag=tag,
+                from_year=from_year,
+                to_year=to_year,
+                cache_dir=_get_cache_root(),
+                keep_cache=True,
+                fetch_only=True,
+            )
+            click.echo()
+            click.echo("=" * 70)
+            click.echo("Fetch Complete!")
+            click.echo("=" * 70)
+            click.echo(f"  Cache:       {counts.get('cache_dir')}")
+            click.echo(f"  Session ID:  {counts.get('session_id')}")
+            click.echo()
+            click.echo("  Use --resume to import this cache into Neo4j later:")
+            click.echo(f"    uv run openalex-neo4j import --resume {counts.get('session_id')}")
+            click.echo("=" * 70)
+            return
+
         # Initialize clients
         click.echo("Connecting to Neo4j...")
         neo4j_client = Neo4jClient(neo4j_uri, neo4j_username, neo4j_password)
         neo4j_client.connect()
 
         click.echo("Initializing OpenAlex client...")
-        openalex_client = OpenAlexClient(email)
+        openalex_client = OpenAlexClient(email, rate_limiter=TokenBucket())
 
         click.echo("Starting import...")
         click.echo()
@@ -204,12 +323,30 @@ def import_data(
 
         # Create importer with session tracking
         importer = OpenAlexImporter(neo4j_client, openalex_client, session_manager=session_manager)
+
+        # Handle --resume (skip API fetch, import from cache)
+        if resume:
+            counts = importer.import_from_cache(
+                resume,
+                _get_cache_root(),
+            )
+            click.echo(f"Resumed import from cache session: {resume}")
+            # Skip quality check for resumed imports — the cache dicts are
+            # already flushed, so importer.works etc. won't be populated.
+            neo4j_client.close()
+            return
+
+        # Normal import from OpenAlex API
         counts = importer.import_from_query(
             query, limit, expand_depth,
             skip_abstracts=skip_abstracts,
             generate_embeddings=generate_embeddings,
             tag=tag,
             skip_constraints=skip_constraints,
+            from_year=from_year,
+            to_year=to_year,
+            cache_dir=_get_cache_root(),
+            keep_cache=keep_cache,
         )
 
         # Quality check and cleaning
@@ -315,6 +452,59 @@ def import_data(
     except Exception as e:
         click.echo(f"\nError: {e}", err=True)
         logger.exception("Import failed")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# count command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="count")
+@click.option(
+    "--query", "-q",
+    required=True,
+    help="OpenAlex search query to count",
+)
+@click.option(
+    "--from-year",
+    type=int,
+    default=None,
+    help="Filter: start publication year (inclusive)",
+)
+@click.option(
+    "--to-year",
+    type=int,
+    default=None,
+    help="Filter: end publication year (inclusive)",
+)
+@click.option(
+    "--email",
+    default=lambda: os.getenv("OPENALEX_EMAIL"),
+    help="Email for OpenAlex polite pool (env: OPENALEX_EMAIL)",
+)
+def count_command(query: str, from_year: int | None, to_year: int | None, email: str | None) -> None:
+    """Count how many works match a search query in OpenAlex.
+
+    Makes a single API call and displays the total count without
+    fetching any work data.
+    """
+    try:
+        client = OpenAlexClient(email, rate_limiter=TokenBucket())
+        total = client.count_works(query, from_year=from_year, to_year=to_year)
+
+        click.echo("=" * 70)
+        click.echo("OpenAlex Query Count")
+        click.echo("=" * 70)
+        click.echo(f"  Query:    {query}")
+        if from_year:
+            click.echo(f"  From:     {from_year}")
+        if to_year:
+            click.echo(f"  To:       {to_year}")
+        click.echo(f"  Matching: {total:,}")
+        click.echo("=" * 70)
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        logger.exception("Count failed")
         sys.exit(1)
 
 

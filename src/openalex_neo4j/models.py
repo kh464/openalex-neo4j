@@ -10,7 +10,7 @@ class ImportSession:
     """Represents a single import session (one run of import command)."""
     id: str
     query: str
-    limit: int = 100
+    limit: int | None = None
     expand_depth: int = 1
     tag: str | None = None
     created_at: datetime | None = None
