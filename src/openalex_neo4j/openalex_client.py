@@ -33,7 +33,6 @@ class OpenAlexClient:
             logger.info(f"Configured OpenAlex with email: {email}")
         else:
             logger.warning("No email configured for OpenAlex polite pool")
-        pyalex.config.max_retries = 5
         self.rate_limiter = rate_limiter
 
     def _rate_limit(self) -> None:
@@ -72,8 +71,7 @@ class OpenAlexClient:
                 request = request.filter(to_publication_date=f"{to_year}-12-31")
 
             per_page = 200 if limit is None else min(200, limit)
-            n_max = limit  # None = no limit, overrides pyalex default 10000
-            pager = request.paginate(per_page=per_page, n_max=n_max)
+            pager = request.paginate(per_page=per_page)
 
             for page in pager:
                 self._rate_limit()
