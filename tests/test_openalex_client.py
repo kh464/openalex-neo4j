@@ -140,7 +140,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Works") as mock_works:
-            mock_works.return_value.filter.return_value.get.return_value = [mock_work_data]
+            mock_works.return_value.filter.return_value.paginate.return_value = [[mock_work_data]]
 
             works = client.fetch_works_by_ids(["W123", "W456"])
 
@@ -161,7 +161,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Authors") as mock_authors:
-            mock_authors.return_value.filter.return_value.get.return_value = [mock_author_data]
+            mock_authors.return_value.filter.return_value.paginate.return_value = [[mock_author_data]]
 
             authors = client.fetch_authors_by_ids(["A123"])
 
@@ -183,7 +183,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Institutions") as mock_institutions:
-            mock_institutions.return_value.filter.return_value.get.return_value = [mock_inst_data]
+            mock_institutions.return_value.filter.return_value.paginate.return_value = [[mock_inst_data]]
 
             institutions = client.fetch_institutions_by_ids(["I123"])
 
@@ -198,7 +198,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Sources") as mock_sources:
-            mock_sources.return_value.filter.return_value.get.return_value = [mock_source_data]
+            mock_sources.return_value.filter.return_value.paginate.return_value = [[mock_source_data]]
 
             sources = client.fetch_sources_by_ids(["S123"])
 
@@ -213,7 +213,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Topics") as mock_topics:
-            mock_topics.return_value.filter.return_value.get.return_value = [mock_topic_data]
+            mock_topics.return_value.filter.return_value.paginate.return_value = [[mock_topic_data]]
 
             topics = client.fetch_topics_by_ids(["T123"])
 
@@ -228,7 +228,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Publishers") as mock_publishers:
-            mock_publishers.return_value.filter.return_value.get.return_value = [mock_pub_data]
+            mock_publishers.return_value.filter.return_value.paginate.return_value = [[mock_pub_data]]
 
             publishers = client.fetch_publishers_by_ids(["P123"])
 
@@ -243,7 +243,7 @@ class TestOpenAlexClient:
         }
 
         with patch("openalex_neo4j.openalex_client.Funders") as mock_funders:
-            mock_funders.return_value.filter.return_value.get.return_value = [mock_funder_data]
+            mock_funders.return_value.filter.return_value.paginate.return_value = [[mock_funder_data]]
 
             funders = client.fetch_funders_by_ids(["F123"])
 
@@ -256,9 +256,23 @@ class TestOpenAlexClient:
         work_ids = [f"W{i}" for i in range(100)]
 
         with patch("openalex_neo4j.openalex_client.Works") as mock_works:
-            mock_works.return_value.filter.return_value.get.return_value = []
+            mock_works.return_value.filter.return_value.paginate.return_value = [[]]
 
             client.fetch_works_by_ids(work_ids)
 
             # Should be called twice (2 batches)
-            assert mock_works.return_value.filter.return_value.get.call_count == 2
+            assert mock_works.return_value.filter.return_value.paginate.call_count == 2
+
+    def test_fetch_authors_by_ids_requests_full_batch_size(self, client):
+        """Batch author fetches request up to 50 results instead of the default 25."""
+        author_ids = [f"A{i}" for i in range(50)]
+
+        with patch("openalex_neo4j.openalex_client.Authors") as mock_authors:
+            mock_authors.return_value.filter.return_value.paginate.return_value = [[]]
+
+            client.fetch_authors_by_ids(author_ids)
+
+            mock_authors.return_value.filter.return_value.paginate.assert_called_once_with(
+                per_page=50,
+                n_max=50,
+            )

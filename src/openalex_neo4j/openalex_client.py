@@ -40,6 +40,32 @@ class OpenAlexClient:
         if self.rate_limiter:
             self.rate_limiter.acquire()
 
+    def _fetch_openalex_batches(
+        self,
+        entity_cls: Any,
+        ids: list[str],
+        *,
+        filter_field: str = "openalex_id",
+    ) -> list[dict[str, Any]]:
+        """Fetch a batch-filtered list of OpenAlex entities without truncation."""
+        results: list[dict[str, Any]] = []
+        batch_size = 50
+
+        for i in range(0, len(ids), batch_size):
+            batch_ids = ids[i:i + batch_size]
+            filter_str = "|".join(f"https://openalex.org/{entity_id}" for entity_id in batch_ids)
+            request = entity_cls().filter(**{filter_field: filter_str})
+
+            # OpenAlex list endpoints default to 25 rows, so iterate with an
+            # explicit per_page/n_max equal to the batch size to avoid silently
+            # dropping half the requested IDs in 50-ID OR filters.
+            pager = request.paginate(per_page=len(batch_ids), n_max=len(batch_ids))
+            for page in pager:
+                self._rate_limit()
+                results.extend(page)
+
+        return results
+
     @staticmethod
     def _normalize_work_types(work_types: list[str] | tuple[str, ...] | None) -> list[str]:
         """Normalize OpenAlex work type filters, preserving order."""
@@ -169,25 +195,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(work_ids)} works by ID")
         works = []
 
-        # Fetch in batches to avoid hitting API limits
-        batch_size = 50
-        for i in range(0, len(work_ids), batch_size):
-            batch_ids = work_ids[i:i + batch_size]
-            try:
-                # Filter by multiple IDs using OR
-                filter_str = "|".join(f"https://openalex.org/{wid}" for wid in batch_ids)
-                self._rate_limit()
-                results = Works().filter(openalex_id=filter_str).get()
-
-                for work_data in results:
-                    try:
-                        work = Work.from_openalex(work_data)
-                        works.append(work)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse work: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch works batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Works, work_ids)
+            for work_data in results:
+                try:
+                    work = Work.from_openalex(work_data)
+                    works.append(work)
+                except Exception as e:
+                    logger.warning(f"Failed to parse work: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch works batch: {e}")
 
         logger.info(f"Fetched {len(works)} works")
         return works
@@ -207,23 +224,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(author_ids)} authors by ID")
         authors = []
 
-        batch_size = 50
-        for i in range(0, len(author_ids), batch_size):
-            batch_ids = author_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{aid}" for aid in batch_ids)
-                self._rate_limit()
-                results = Authors().filter(openalex_id=filter_str).get()
-
-                for author_data in results:
-                    try:
-                        author = Author.from_openalex(author_data)
-                        authors.append(author)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse author: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch authors batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Authors, author_ids)
+            for author_data in results:
+                try:
+                    author = Author.from_openalex(author_data)
+                    authors.append(author)
+                except Exception as e:
+                    logger.warning(f"Failed to parse author: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch authors batch: {e}")
 
         logger.info(f"Fetched {len(authors)} authors")
         return authors
@@ -243,23 +253,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(institution_ids)} institutions by ID")
         institutions = []
 
-        batch_size = 50
-        for i in range(0, len(institution_ids), batch_size):
-            batch_ids = institution_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{iid}" for iid in batch_ids)
-                self._rate_limit()
-                results = Institutions().filter(openalex_id=filter_str).get()
-
-                for inst_data in results:
-                    try:
-                        institution = Institution.from_openalex(inst_data)
-                        institutions.append(institution)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse institution: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch institutions batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Institutions, institution_ids)
+            for inst_data in results:
+                try:
+                    institution = Institution.from_openalex(inst_data)
+                    institutions.append(institution)
+                except Exception as e:
+                    logger.warning(f"Failed to parse institution: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch institutions batch: {e}")
 
         logger.info(f"Fetched {len(institutions)} institutions")
         return institutions
@@ -279,23 +282,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(source_ids)} sources by ID")
         sources = []
 
-        batch_size = 50
-        for i in range(0, len(source_ids), batch_size):
-            batch_ids = source_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{sid}" for sid in batch_ids)
-                self._rate_limit()
-                results = Sources().filter(openalex_id=filter_str).get()
-
-                for source_data in results:
-                    try:
-                        source = Source.from_openalex(source_data)
-                        sources.append(source)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse source: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch sources batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Sources, source_ids)
+            for source_data in results:
+                try:
+                    source = Source.from_openalex(source_data)
+                    sources.append(source)
+                except Exception as e:
+                    logger.warning(f"Failed to parse source: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch sources batch: {e}")
 
         logger.info(f"Fetched {len(sources)} sources")
         return sources
@@ -315,23 +311,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(topic_ids)} topics by ID")
         topics = []
 
-        batch_size = 50
-        for i in range(0, len(topic_ids), batch_size):
-            batch_ids = topic_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{tid}" for tid in batch_ids)
-                self._rate_limit()
-                results = Topics().filter(openalex=filter_str).get()
-
-                for topic_data in results:
-                    try:
-                        topic = Topic.from_openalex(topic_data)
-                        topics.append(topic)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse topic: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch topics batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Topics, topic_ids, filter_field="openalex")
+            for topic_data in results:
+                try:
+                    topic = Topic.from_openalex(topic_data)
+                    topics.append(topic)
+                except Exception as e:
+                    logger.warning(f"Failed to parse topic: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch topics batch: {e}")
 
         logger.info(f"Fetched {len(topics)} topics")
         return topics
@@ -351,23 +340,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(publisher_ids)} publishers by ID")
         publishers = []
 
-        batch_size = 50
-        for i in range(0, len(publisher_ids), batch_size):
-            batch_ids = publisher_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{pid}" for pid in batch_ids)
-                self._rate_limit()
-                results = Publishers().filter(openalex_id=filter_str).get()
-
-                for pub_data in results:
-                    try:
-                        publisher = Publisher.from_openalex(pub_data)
-                        publishers.append(publisher)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse publisher: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch publishers batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Publishers, publisher_ids)
+            for pub_data in results:
+                try:
+                    publisher = Publisher.from_openalex(pub_data)
+                    publishers.append(publisher)
+                except Exception as e:
+                    logger.warning(f"Failed to parse publisher: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch publishers batch: {e}")
 
         logger.info(f"Fetched {len(publishers)} publishers")
         return publishers
@@ -387,23 +369,16 @@ class OpenAlexClient:
         logger.info(f"Fetching {len(funder_ids)} funders by ID")
         funders = []
 
-        batch_size = 50
-        for i in range(0, len(funder_ids), batch_size):
-            batch_ids = funder_ids[i:i + batch_size]
-            try:
-                filter_str = "|".join(f"https://openalex.org/{fid}" for fid in batch_ids)
-                self._rate_limit()
-                results = Funders().filter(openalex_id=filter_str).get()
-
-                for funder_data in results:
-                    try:
-                        funder = Funder.from_openalex(funder_data)
-                        funders.append(funder)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse funder: {e}")
-
-            except Exception as e:
-                logger.error(f"Failed to fetch funders batch: {e}")
+        try:
+            results = self._fetch_openalex_batches(Funders, funder_ids)
+            for funder_data in results:
+                try:
+                    funder = Funder.from_openalex(funder_data)
+                    funders.append(funder)
+                except Exception as e:
+                    logger.warning(f"Failed to parse funder: {e}")
+        except Exception as e:
+            logger.error(f"Failed to fetch funders batch: {e}")
 
         logger.info(f"Fetched {len(funders)} funders")
         return funders
