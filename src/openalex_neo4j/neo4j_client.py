@@ -249,18 +249,24 @@ class Neo4jClient:
                 MERGE (n:{label} {{id: item.id}})
                 ON CREATE SET
                   n += item {{.*, _label: null, current_session: null, current_timestamp: null,
-                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                              import_sessions: null, import_tags: null,
+                              first_imported_at: null, last_imported_at: null}},
                   n.import_sessions = [item.current_session],
+                  n.import_tags = coalesce(item.import_tags, []),
                   n.first_imported_at = item.current_timestamp,
                   n.last_imported_at = item.current_timestamp
                 ON MATCH SET
                   n += item {{.*, _label: null, current_session: null, current_timestamp: null,
-                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                              import_sessions: null, import_tags: null,
+                              first_imported_at: null, last_imported_at: null}},
                   n.import_sessions =
                     CASE WHEN item.current_session IN coalesce(n.import_sessions, [])
                     THEN n.import_sessions
                     ELSE coalesce(n.import_sessions, []) + item.current_session
                     END,
+                  n.import_tags =
+                    reduce(tags = coalesce(n.import_tags, []), tag IN coalesce(item.import_tags, []) |
+                      CASE WHEN tag IN tags THEN tags ELSE tags + tag END),
                   n.last_imported_at = item.current_timestamp
                 SET n:$(item._label)
                 RETURN count(n) as count
@@ -271,18 +277,24 @@ class Neo4jClient:
                 MERGE (n:{label} {{id: item.id}})
                 ON CREATE SET
                   n += item {{.*, current_session: null, current_timestamp: null,
-                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                              import_sessions: null, import_tags: null,
+                              first_imported_at: null, last_imported_at: null}},
                   n.import_sessions = [item.current_session],
+                  n.import_tags = coalesce(item.import_tags, []),
                   n.first_imported_at = item.current_timestamp,
                   n.last_imported_at = item.current_timestamp
                 ON MATCH SET
                   n += item {{.*, current_session: null, current_timestamp: null,
-                              import_sessions: null, first_imported_at: null, last_imported_at: null}},
+                              import_sessions: null, import_tags: null,
+                              first_imported_at: null, last_imported_at: null}},
                   n.import_sessions =
                     CASE WHEN item.current_session IN coalesce(n.import_sessions, [])
                     THEN n.import_sessions
                     ELSE coalesce(n.import_sessions, []) + item.current_session
                     END,
+                  n.import_tags =
+                    reduce(tags = coalesce(n.import_tags, []), tag IN coalesce(item.import_tags, []) |
+                      CASE WHEN tag IN tags THEN tags ELSE tags + tag END),
                   n.last_imported_at = item.current_timestamp
                 RETURN count(n) as count
                 """
@@ -292,7 +304,10 @@ class Neo4jClient:
                 query = f"""
                 UNWIND $batch AS item
                 MERGE (n:{label} {{id: item.id}})
-                SET n += item {{.*, _label: null}},
+                SET n += item {{.*, _label: null, import_tags: null}},
+                    n.import_tags =
+                      reduce(tags = coalesce(n.import_tags, []), tag IN coalesce(item.import_tags, []) |
+                        CASE WHEN tag IN tags THEN tags ELSE tags + tag END),
                     n:$(item._label)
                 RETURN count(n) as count
                 """
@@ -300,7 +315,10 @@ class Neo4jClient:
                 query = f"""
                 UNWIND $batch AS item
                 MERGE (n:{label} {{id: item.id}})
-                SET n += item
+                SET n += item {{.*, import_tags: null}},
+                    n.import_tags =
+                      reduce(tags = coalesce(n.import_tags, []), tag IN coalesce(item.import_tags, []) |
+                        CASE WHEN tag IN tags THEN tags ELSE tags + tag END)
                 RETURN count(n) as count
                 """
 

@@ -150,8 +150,6 @@ import --query "..."
   ├── search_works() → 初始 Work 列表（limit=None 时拉取全部）
   ├── DataSerializer.append_batch("Work", works)
   │
-  ├── 大导入保护：limit 不指定或 > 5000 时自动限 expand_depth=1，跳过引用展开
-  │
   ├── expand_depth 循环（并行展开，令牌桶限频）:
   │   ├── 从缓存读取 works → 提取缺失 ID
   │   ├── ThreadPoolExecutor 并行 fetch:
@@ -351,7 +349,7 @@ search --query "neural networks"
 | 搜索融合 | RRF | 无需调参，优于加权平均 |
 | 数据源扩展 | ABC + 注册表 | 降低新增数据源的耦合 |
 | API 限频 | 令牌桶（TokenBucket） | 线程安全，支持并行请求时不超过 10 req/s polite pool 限制 |
-| 大导入保护 | limit > 5000 自动限制 | 防止引用展开导致 API 调用爆炸 |
+| 关系展开 | 由 `expand_depth` 控制 | 不再因抓取规模自动跳过 `referenced_works` |
 | 内存管理 | 流式逐类型读写 | 替代一次性 `read_all()`，峰值内存从 ~588 MB 降至 ~250 MB |
 
 ---

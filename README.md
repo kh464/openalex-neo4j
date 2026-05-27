@@ -111,6 +111,7 @@ uv run openalex-neo4j --help
 | 命令 | 用途 |
 |------|------|
 | `import` | 从 OpenAlex API 搜索并导入数据（支持 `--fetch-only` 仅缓存） |
+| `export` | 按节点自定义标签从 Neo4j 导出数据到 JSONL |
 | `count` | 查询关键词在 OpenAlex 中的匹配总数 |
 | `search` | 在已导入的 Neo4j 图谱中混合搜索 |
 | `enrich` | 从多数据源富化缺失字段 |
@@ -131,6 +132,11 @@ uv run openalex-neo4j import --query "人工智能" --limit 50
 # 带时间范围
 uv run openalex-neo4j import --query "量子计算" --from-year 2020 --to-year 2024
 
+# 按 OpenAlex 文献类型过滤，可重复使用；下面只抓 article 和 review
+uv run openalex-neo4j import --query "terrorism" --from-year 1990 --to-year 2003 \
+  --type article \
+  --type review
+
 # 导入时生成嵌入向量（用于语义搜索）
 uv run openalex-neo4j import \
   --query "机器学习伦理" \
@@ -149,6 +155,14 @@ uv run openalex-neo4j import --query "计算机视觉" --limit 30 --clean auto
 # 为导入会话添加标签
 uv run openalex-neo4j import --query "深度学习" --limit 50 --tag "nlp-2024"
 
+# 为本次导入的所有节点添加自定义标签属性
+uv run openalex-neo4j import --query "graph neural networks" --limit 100 --node-tag "batch-2026q2"
+
+# 为本次导入的所有节点添加多个自定义标签属性
+uv run openalex-neo4j import --query "knowledge graph" --limit 100 \
+  --node-tag "batch-2026q2" \
+  --node-tag "project-alpha"
+
 # 仅抓取到本地缓存，不导入 Neo4j（无需 Neo4j 连接）
 uv run openalex-neo4j import --query "regenerative medicine" --limit 100 --from-year 2023 --to-year 2024 --fetch-only
 
@@ -162,20 +176,28 @@ uv run openalex-neo4j import --query dummy --limit 1 --list-cache
 uv run openalex-neo4j import --resume S20260508_1234_0001
 ```
 
+当前实现说明：
+
+- 不指定 `--limit` 时，CLI 会持续分页抓取，直到 OpenAlex 不再返回结果。
+- `--limit` 可以设置为大于 `10000` 的值；项目本身不再施加 `10000` 条抓取上限。
+- 是否展开 `referenced_works` 仅由 `--expand-depth` 控制，不会因为抓取规模过大而自动跳过引用展开。
+
 **import 选项：**
 
 | 选项 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `--query, -q` | str | 必填 | OpenAlex 搜索查询 |
-| `--limit, -l` | int | 100 | 最大获取数量 |
+| `--limit, -l` | int | all matching | 最大获取数量；省略时抓取全部匹配结果 |
 | `--from-year` | int | — | 起始出版年（含） |
 | `--to-year` | int | — | 截止出版年（含） |
+| `--type` | str | — | OpenAlex 文献类型过滤，例如 `article` / `review`，可重复使用 |
 | `--expand-depth` | int | 1 | 关系扩展深度 |
 | `--skip-abstracts` | flag | — | 跳过摘要存储 |
 | `--generate-embeddings` | flag | — | 生成嵌入向量 |
 | `--quality-report` | flag | — | 导入后运行质量检查 |
 | `--clean` | str | off | 数据清洗: off / report / auto |
 | `--tag` | str | — | 导入会话标签 |
+| `--node-tag` | str | — | 给本次导入的所有节点写入 `import_tags` 属性，可重复使用 |
 | `--skip-constraints` | flag | — | 跳过约束创建 |
 | `--cache-dir` | path | `~/.openalex-neo4j/cache/` | 本地缓存根目录 |
 | `--keep-cache` | flag | — | 保留缓存不删除 |
@@ -187,6 +209,33 @@ uv run openalex-neo4j import --resume S20260508_1234_0001
 | `--email` | str | env | OpenAlex polite pool 邮箱 |
 | `--verbose, -v` | flag | — | 详细日志 |
 | `--fetch-only` | flag | — | 仅抓取到本地缓存，跳过 Neo4j 导入 |
+
+---
+
+### export — 按自定义节点标签导出
+
+将带有指定 `import_tags` 的节点导出为 JSONL，每行一个节点属性对象，并附带 `_labels` 字段。
+
+```bash
+# 导出某个批次标签下的所有节点
+uv run openalex-neo4j export --node-tag "batch-2026q2" --output exports/batch-2026q2.jsonl
+
+# 仅导出指定标签下的 Work 和 Author 节点
+uv run openalex-neo4j export \
+  --node-tag "project-alpha" \
+  --label Work \
+  --label Author \
+  --output exports/project-alpha-work-author.jsonl
+```
+
+导入后也可以直接在 Neo4j 中按标签筛选：
+
+```cypher
+MATCH (n)
+WHERE "batch-2026q2" IN coalesce(n.import_tags, [])
+RETURN labels(n), n.id, n.title
+LIMIT 50
+```
 
 ---
 

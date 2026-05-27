@@ -312,6 +312,65 @@ class TestImportCacheOptions:
         assert "cache_dir" in kwargs
         assert "keep_cache" in kwargs
         assert kwargs["keep_cache"] is True
+        assert kwargs["node_tags"] == []
+        assert kwargs["work_types"] == []
+
+    @patch("openalex_neo4j.cli.Neo4jClient")
+    @patch("openalex_neo4j.cli.OpenAlexClient")
+    def test_import_node_tags_passed_to_importer(
+        self, mock_oa_client_cls, mock_neo4j_cls, runner, tmp_path,
+    ):
+        """--node-tag is forwarded to importer.import_from_query."""
+        mock_neo4j_instance = Mock()
+        mock_neo4j_instance.connect = Mock()
+        mock_neo4j_instance.close = Mock()
+        mock_neo4j_cls.return_value = mock_neo4j_instance
+
+        mock_importer = Mock()
+        mock_importer.import_from_query.return_value = {}
+        mock_importer.current_session = "S_test"
+
+        with patch("openalex_neo4j.cli.OpenAlexImporter", return_value=mock_importer):
+            result = runner.invoke(cli, [
+                "import",
+                "--query", "test",
+                "--limit", "1",
+                "--neo4j-password", "pw",
+                "--node-tag", "batch-a",
+                "--node-tag", "2026-q2",
+            ])
+        assert result.exit_code == 0
+        _, kwargs = mock_importer.import_from_query.call_args
+        assert kwargs["node_tags"] == ["batch-a", "2026-q2"]
+
+    @patch("openalex_neo4j.cli.Neo4jClient")
+    @patch("openalex_neo4j.cli.OpenAlexClient")
+    def test_import_work_types_passed_to_importer(
+        self, mock_oa_client_cls, mock_neo4j_cls, runner, tmp_path,
+    ):
+        """--type is repeatable and forwarded to importer.import_from_query."""
+        mock_neo4j_instance = Mock()
+        mock_neo4j_instance.connect = Mock()
+        mock_neo4j_instance.close = Mock()
+        mock_neo4j_cls.return_value = mock_neo4j_instance
+
+        mock_importer = Mock()
+        mock_importer.import_from_query.return_value = {}
+        mock_importer.current_session = "S_test"
+
+        with patch("openalex_neo4j.cli.OpenAlexImporter", return_value=mock_importer):
+            result = runner.invoke(cli, [
+                "import",
+                "--query", "test",
+                "--limit", "1",
+                "--neo4j-password", "pw",
+                "--type", "article",
+                "--type", "review",
+            ])
+        assert result.exit_code == 0
+        _, kwargs = mock_importer.import_from_query.call_args
+        assert kwargs["work_types"] == ["article", "review"]
+        assert "Work types: article, review" in result.output
 
     @patch("openalex_neo4j.cli.Neo4jClient")
     @patch("openalex_neo4j.cli.OpenAlexClient")
@@ -337,7 +396,36 @@ class TestImportCacheOptions:
             ])
         assert result.exit_code == 0
         mock_importer.import_from_cache.assert_called_once()
+        _, kwargs = mock_importer.import_from_cache.call_args
+        assert kwargs["node_tags"] == []
         assert "Resumed import" in result.output
+
+    @patch("openalex_neo4j.cli.Neo4jClient")
+    @patch("openalex_neo4j.cli.OpenAlexClient")
+    def test_import_resume_passes_node_tags(
+        self, mock_oa_client_cls, mock_neo4j_cls, runner, tmp_path,
+    ):
+        """--resume forwards --node-tag to importer.import_from_cache."""
+        mock_neo4j_instance = Mock()
+        mock_neo4j_instance.connect = Mock()
+        mock_neo4j_instance.close = Mock()
+        mock_neo4j_cls.return_value = mock_neo4j_instance
+
+        mock_importer = Mock()
+        mock_importer.import_from_cache.return_value = {"works": 5}
+
+        with patch("openalex_neo4j.cli.OpenAlexImporter", return_value=mock_importer):
+            result = runner.invoke(cli, [
+                "import",
+                "--query", "test",
+                "--limit", "1",
+                "--neo4j-password", "pw",
+                "--resume", "S20260508_1200",
+                "--node-tag", "batch-a",
+            ])
+        assert result.exit_code == 0
+        _, kwargs = mock_importer.import_from_cache.call_args
+        assert kwargs["node_tags"] == ["batch-a"]
 
     def test_import_list_cache_no_dir(self, runner, tmp_path):
         """--list-cache with an empty cache directory."""
@@ -372,3 +460,55 @@ class TestImportCacheOptions:
         assert "S20260508_1200" in result.output
         assert "machine learning" in result.output
         assert "10" in result.output
+
+
+class TestExportCommand:
+    """Tests for `openalex-neo4j export`."""
+
+    @patch("openalex_neo4j.cli._get_neo4j_client")
+    def test_export_by_node_tag(self, mock_get_neo4j, runner, tmp_path, mock_neo4j_client):
+        """export writes matching tagged nodes to JSONL."""
+        client, session_mock = mock_neo4j_client
+        session_mock.run.return_value = [
+            {"labels": ["Work"], "props": {"id": "W1", "title": "Paper", "import_tags": ["batch-a"]}},
+            {"labels": ["Author"], "props": {"id": "A1", "display_name": "Alice", "import_tags": ["batch-a"]}},
+        ]
+        mock_get_neo4j.return_value = client
+
+        output = tmp_path / "export.jsonl"
+        result = runner.invoke(cli, [
+            "export",
+            "--neo4j-password", "pw",
+            "--node-tag", "batch-a",
+            "--output", str(output),
+        ])
+
+        assert result.exit_code == 0
+        assert output.exists()
+        lines = output.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+        assert "Exported 2 nodes" in result.output
+        first_call_kwargs = session_mock.run.call_args[1]
+        assert first_call_kwargs["node_tag"] == "batch-a"
+        assert first_call_kwargs["labels"] == []
+
+    @patch("openalex_neo4j.cli._get_neo4j_client")
+    def test_export_with_label_filter(self, mock_get_neo4j, runner, tmp_path, mock_neo4j_client):
+        """export forwards optional label filters."""
+        client, session_mock = mock_neo4j_client
+        session_mock.run.return_value = []
+        mock_get_neo4j.return_value = client
+
+        output = tmp_path / "export.jsonl"
+        result = runner.invoke(cli, [
+            "export",
+            "--neo4j-password", "pw",
+            "--node-tag", "batch-a",
+            "--label", "Work",
+            "--label", "Author",
+            "--output", str(output),
+        ])
+
+        assert result.exit_code == 0
+        first_call_kwargs = session_mock.run.call_args[1]
+        assert first_call_kwargs["labels"] == ["Work", "Author"]

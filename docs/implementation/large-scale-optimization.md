@@ -1,5 +1,7 @@
 # 大规模导入优化执行方案
 
+> 注意：本文记录的是一版历史优化方案。其中“limit > 5000 时自动限制展开深度并跳过引用展开”的实现已被移除，当前代码会按 `expand_depth` 实际展开 `referenced_works`，且搜索分页不再继承 PyAlex 默认的 `10000` 条上限。
+
 ## 概述
 
 基于 `docs/analysis/large-scale-import.md` 的分析结果，实现三个优化维度的增量改造：API 调用量优化（自动限 depth + 并行请求）、内存优化（按类型分批读取）、Neo4j 写入优化（不做改动）。
@@ -21,11 +23,11 @@
 
 ---
 
-## Step 1：API 调用量 — 自动限制展开深度 — ✅ 已完成
+## Step 1：历史方案 — API 调用量自动限制展开深度 — 已移除
 
 ### 1.1 修改点
 
-在 `OpenAlexImporter` 中添加阈值常量，并在 `import_from_query()` 中引入保护逻辑。
+当时在 `OpenAlexImporter` 中添加阈值常量，并在 `import_from_query()` 中引入保护逻辑。该逻辑现已从代码中移除。
 
 ### 1.2 具体实现
 
@@ -35,7 +37,7 @@
 LARGE_IMPORT_THRESHOLD = 5000
 ```
 
-在 `import_from_query()` 中，在 expand_depth 循环之前插入保护逻辑：
+以下是当时在 `import_from_query()` 中加入的保护逻辑（现已删除）：
 
 ```python
 # 大导入保护：limit > 阈值时自动限制展开行为
@@ -52,7 +54,7 @@ if limit > self.LARGE_IMPORT_THRESHOLD:
     )
 ```
 
-### 1.3 跳过引用展开的逻辑
+### 1.3 历史方案：跳过引用展开的逻辑
 
 当前 `_expand_and_save_relationships()` 会提取 `referenced_work_ids` 并回查 API 获取这些引用 Work。跳过方式有两种：
 
@@ -396,9 +398,9 @@ counts = {**node_counts, **rel_counts}
 
 | 测试 | 说明 |
 |---|---|
-| `test_large_import_auto_limit_depth` | limit > 5000 时强制 depth=1 |
-| `test_large_import_skip_referenced` | 大导入跳过引用展开 |
-| `test_small_import_no_limit` | limit ≤ 5000 不做限制 |
+| `test_large_import_auto_limit_depth` | 历史测试：limit > 5000 时强制 depth=1 |
+| `test_large_import_skip_referenced` | 历史测试：大导入跳过引用展开 |
+| `test_small_import_no_limit` | 历史测试：limit ≤ 5000 不做限制 |
 | `test_import_nodes_streaming` | 流式节点创建结果与原有方法一致 |
 | `test_import_relationships_streaming` | 流式关系创建结果与原有方法一致 |
 
@@ -439,7 +441,7 @@ git revert HEAD --no-edit
 |---|---|---|
 | 1 | `rate_limiter.py` 新增 | 无 |
 | 2 | `openalex_client.py` 注入令牌桶 | Step 1 |
-| 3 | `importer.py` — 大导入限制 depth + 跳过引用 | 无 |
+| 3 | `importer.py` — 历史版大导入限制 depth + 跳过引用 | 无 |
 | 4 | `importer.py` — 并行展开关系 | Step 1, 2 |
 | 5 | `importer.py` — 流式节点创建 + 关系创建 | 无 |
 | 6 | `serializer.py` — 按标签读取增强（如有需要） | 无 |
@@ -453,8 +455,8 @@ git revert HEAD --no-edit
 
 | 指标 | 当前值 | 优化后 |
 |---|---|---|
-| API 调用（10 万篇，expand_depth=1） | ~23750 次 | ~3750 次（跳过引用） |
-| API 耗时（polite pool 10/s） | ~40 分钟 | ~5 分钟 |
+| API 调用（10 万篇，expand_depth=1） | ~23750 次 | ~3750 次（历史方案：跳过引用） |
+| API 耗时（polite pool 10/s） | ~40 分钟 | ~5 分钟（历史方案） |
 | 峰值内存 | ~588 MB + overhead ≈ 1-2 GB | ~250 MB |
 | Neo4j 写入 | ~2 分钟 | ~2 分钟（不变） |
 | 总耗时（embedding 关闭） | ~8 分钟 | ~8 分钟（瓶颈在 API 限频） |

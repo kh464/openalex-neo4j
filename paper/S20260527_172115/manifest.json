@@ -1,0 +1,28 @@
+{
+  "session_id": "S20260527_172115",
+  "query": "terrorism",
+  "source": "openalex-api",
+  "created_at": "2026-05-27T18:07:16.858835",
+  "parameters": {
+    "limit": null,
+    "expand_depth": 1,
+    "skip_abstracts": false,
+    "generate_embeddings": false,
+    "from_year": 1990,
+    "to_year": 2003,
+    "work_types": [
+      "article",
+      "review"
+    ],
+    "node_tags": []
+  },
+  "entity_counts": {
+    "Work": 47173,
+    "Author": 8525,
+    "Institution": 1400,
+    "Source": 1600,
+    "Topic": 1103,
+    "Publisher": 289,
+    "Funder": 0
+  }
+}

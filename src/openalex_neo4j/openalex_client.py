@@ -40,25 +40,45 @@ class OpenAlexClient:
         if self.rate_limiter:
             self.rate_limiter.acquire()
 
+    @staticmethod
+    def _normalize_work_types(work_types: list[str] | tuple[str, ...] | None) -> list[str]:
+        """Normalize OpenAlex work type filters, preserving order."""
+        if not work_types:
+            return []
+
+        normalized: list[str] = []
+        for raw_type in work_types:
+            if raw_type is None:
+                continue
+            work_type = raw_type.strip().lower()
+            if work_type and work_type not in normalized:
+                normalized.append(work_type)
+        return normalized
+
     def search_works(
         self, query: str, limit: int | None = None,
         from_year: int | None = None, to_year: int | None = None,
+        work_types: list[str] | tuple[str, ...] | None = None,
     ) -> list[Work]:
-        """Search for works matching query, optionally filtered by publication year.
+        """Search for works matching query, optionally filtered by year/type.
 
         Args:
             query: Search query string
             limit: Maximum number of works to return, or ``None`` for all.
             from_year: Optional start year (inclusive), passed as from_publication_date
             to_year: Optional end year (inclusive), passed as to_publication_date
+            work_types: Optional OpenAlex work types (OR filter), e.g.
+                ``["article", "review"]``.
 
         Returns:
             List of Work objects
         """
+        normalized_work_types = self._normalize_work_types(work_types)
         logger.info(
             f"Searching for works: '{query}' (limit={'all' if limit is None else limit}"
             f"{f', from={from_year}' if from_year else ''}"
-            f"{f', to={to_year}' if to_year else ''})"
+            f"{f', to={to_year}' if to_year else ''}"
+            f"{f', types={normalized_work_types}' if normalized_work_types else ''})"
         )
 
         works = []
@@ -69,9 +89,13 @@ class OpenAlexClient:
                 request = request.filter(from_publication_date=f"{from_year}-01-01")
             if to_year:
                 request = request.filter(to_publication_date=f"{to_year}-12-31")
+            if normalized_work_types:
+                request = request.filter(type="|".join(normalized_work_types))
 
             per_page = 200 if limit is None else min(200, limit)
-            pager = request.paginate(per_page=per_page)
+            # Pass n_max explicitly so PyAlex's default 10,000-result cap
+            # does not apply when limit is omitted or set above 10,000.
+            pager = request.paginate(per_page=per_page, n_max=limit)
 
             for page in pager:
                 self._rate_limit()
@@ -97,6 +121,7 @@ class OpenAlexClient:
     def count_works(
         self, query: str,
         from_year: int | None = None, to_year: int | None = None,
+        work_types: list[str] | tuple[str, ...] | None = None,
     ) -> int:
         """Get total count of works matching a search query (no data fetch).
 
@@ -104,10 +129,13 @@ class OpenAlexClient:
             query: Search query string
             from_year: Optional start year (inclusive)
             to_year: Optional end year (inclusive)
+            work_types: Optional OpenAlex work types (OR filter), e.g.
+                ``["article", "review"]``.
 
         Returns:
             Total matching work count from OpenAlex meta, or 0 on error.
         """
+        normalized_work_types = self._normalize_work_types(work_types)
         logger.info(f"Counting works for: '{query}'")
         try:
             request = Works().search(query)
@@ -115,6 +143,8 @@ class OpenAlexClient:
                 request = request.filter(from_publication_date=f"{from_year}-01-01")
             if to_year:
                 request = request.filter(to_publication_date=f"{to_year}-12-31")
+            if normalized_work_types:
+                request = request.filter(type="|".join(normalized_work_types))
             self._rate_limit()
             result = request.get()
             count = result.meta["count"]

@@ -52,6 +52,7 @@ class OpenAlexImporter:
         self.topics: dict[str, Topic] = {}
         self.publishers: dict[str, Publisher] = {}
         self.funders: dict[str, Funder] = {}
+        self.node_tags: list[str] = []
 
     def import_from_query(
         self,
@@ -64,9 +65,11 @@ class OpenAlexImporter:
         skip_constraints: bool = False,
         from_year: int | None = None,
         to_year: int | None = None,
+        work_types: list[str] | tuple[str, ...] | None = None,
         cache_dir: str | Path | None = None,
         keep_cache: bool = False,
         fetch_only: bool = False,
+        node_tags: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, int]:
         """Import data starting from a search query, using local JSONL cache.
 
@@ -83,10 +86,14 @@ class OpenAlexImporter:
             skip_constraints: If True, skip creating constraints and indexes
             from_year: Optional start year for filtering works
             to_year: Optional end year for filtering works
+            work_types: Optional OpenAlex work types used to filter initial
+                works, e.g. ``["article", "review"]``.
             cache_dir: Local cache directory (default: ~/.openalex-neo4j/cache/)
             keep_cache: If True, keep cache after import (for debugging/resume)
             fetch_only: If True, skip Neo4j import phase entirely (cache-only).
                 Implies keep_cache=True.
+            node_tags: Optional custom tags stored on every imported node as
+                the ``import_tags`` property.
 
         Returns:
             Dictionary with counts of imported entities
@@ -99,7 +106,10 @@ class OpenAlexImporter:
             f"skip_abstracts={skip_abstracts}, generate_embeddings={generate_embeddings}"
             f"{f', from_year={from_year}' if from_year else ''}"
             f"{f', to_year={to_year}' if to_year else ''}"
+            f"{f', work_types={list(work_types)}' if work_types else ''}"
         )
+        self.node_tags = self._normalize_tags(node_tags)
+        normalized_work_types = self._normalize_work_types(work_types)
 
         # ─── Initialize session and cache ───
         if self.session_manager:
@@ -117,30 +127,16 @@ class OpenAlexImporter:
         self.serializer = DataSerializer(cache_root, self.current_session)
         logger.info(f"Cache directory: {self.serializer.data_dir}")
 
-        # ─── Large import protection ───
-        is_large = limit is None or limit > self.LARGE_IMPORT_THRESHOLD
-        if is_large:
-            if expand_depth > 1:
-                logger.warning(
-                    f"Large import (limit={limit_str}): forcing expand_depth=1 "
-                    f"(was {expand_depth}) to avoid excessive API calls"
-                )
-                expand_depth = 1
-            logger.info(
-                f"Large import (limit={limit_str}): referenced_works expansion "
-                f"will be skipped automatically"
-            )
-
         # ─── Fetch phase: API → JSONL ───
         initial_works = self.openalex.search_works(
             query, limit, from_year=from_year, to_year=to_year,
+            work_types=normalized_work_types,
         )
         self._save_works_batch(initial_works)
 
-        skip_referenced = is_large
         for depth in range(1, expand_depth + 1):
             logger.info(f"Expanding relationships at depth {depth}")
-            self._expand_and_save_relationships(skip_referenced=skip_referenced)
+            self._expand_and_save_relationships()
 
         # ─── Post-fetch processing ───
         if skip_abstracts:
@@ -194,6 +190,8 @@ class OpenAlexImporter:
                 "generate_embeddings": generate_embeddings,
                 "from_year": from_year,
                 "to_year": to_year,
+                "work_types": normalized_work_types,
+                "node_tags": self.node_tags,
             },
             "entity_counts": entity_counts,
         })
@@ -243,10 +241,70 @@ class OpenAlexImporter:
         "funder_ids", "referenced_work_ids", "publisher_id",
     }
 
-    # When the number of works exceeds this threshold, the importer
-    # automatically limits expansion depth and skips referenced-works
-    # expansion to avoid excessive API calls.
-    LARGE_IMPORT_THRESHOLD = 5000
+    @staticmethod
+    def _normalize_tags(node_tags: list[str] | tuple[str, ...] | None) -> list[str]:
+        """Normalize custom node tags, preserving order while deduplicating."""
+        if not node_tags:
+            return []
+
+        normalized: list[str] = []
+        for raw_tag in node_tags:
+            if raw_tag is None:
+                continue
+            tag = raw_tag.strip()
+            if tag and tag not in normalized:
+                normalized.append(tag)
+        return normalized
+
+    @staticmethod
+    def _normalize_work_types(work_types: list[str] | tuple[str, ...] | None) -> list[str]:
+        """Normalize OpenAlex work type filters, preserving order."""
+        if not work_types:
+            return []
+
+        normalized: list[str] = []
+        for raw_type in work_types:
+            if raw_type is None:
+                continue
+            work_type = raw_type.strip().lower()
+            if work_type and work_type not in normalized:
+                normalized.append(work_type)
+        return normalized
+
+    def _merge_import_tags(self, existing_tags: Any) -> list[str]:
+        """Merge active node tags with any existing cached node tags."""
+        merged: list[str] = []
+
+        if isinstance(existing_tags, list):
+            for tag in existing_tags:
+                if isinstance(tag, str):
+                    clean = tag.strip()
+                    if clean and clean not in merged:
+                        merged.append(clean)
+        elif isinstance(existing_tags, str):
+            clean = existing_tags.strip()
+            if clean:
+                merged.append(clean)
+
+        for tag in self.node_tags:
+            if tag not in merged:
+                merged.append(tag)
+
+        return merged
+
+    def _attach_import_metadata(
+        self,
+        node: dict[str, Any],
+        timestamp: str | None = None,
+    ) -> None:
+        """Attach session metadata and custom node tags to a node dict."""
+        if self.current_session:
+            node["current_session"] = self.current_session
+            node["current_timestamp"] = timestamp or datetime.now().isoformat()
+
+        merged_tags = self._merge_import_tags(node.get("import_tags"))
+        if merged_tags:
+            node["import_tags"] = merged_tags
 
     def _save_works_batch(self, works: list[Work]) -> None:
         """Serialize a batch of Work objects to the local JSONL cache."""
@@ -262,8 +320,7 @@ class OpenAlexImporter:
                 "funder_ids": work.funder_ids,
                 "referenced_work_ids": work.referenced_work_ids,
             })
-            nodes[i]["current_session"] = self.current_session
-            nodes[i]["current_timestamp"] = ts
+            self._attach_import_metadata(nodes[i], ts)
         self.serializer.append_batch("Work", nodes)
 
     def _expand_relationships(self) -> None:
@@ -339,15 +396,12 @@ class OpenAlexImporter:
             for pub in publishers:
                 self.publishers[pub.id] = pub
 
-    def _expand_and_save_relationships(self, skip_referenced: bool = False) -> None:
+    def _expand_and_save_relationships(self) -> None:
         """Fetch related entities for cached works and save to JSONL cache.
 
         Entity types are fetched in parallel via ``ThreadPoolExecutor``.
         The ``TokenBucket`` rate limiter inside ``OpenAlexClient`` prevents
         the parallel requests from exceeding the polite-pool limit.
-
-        Args:
-            skip_referenced: If True, skip fetching referenced works (citations).
         """
         cached_works = self.serializer.read("Work")
 
@@ -397,8 +451,7 @@ class OpenAlexImporter:
 
         def _save(nodes: list[dict], label: str) -> None:
             for node in nodes:
-                node["current_session"] = self.current_session
-                node["current_timestamp"] = ts
+                self._attach_import_metadata(node, ts)
             self.serializer.append_batch(label, nodes)
 
         # ─── Parallel fetch ───
@@ -447,7 +500,7 @@ class OpenAlexImporter:
                 _save([e.to_node_dict() for e in entities], "Funder")
             tasks.append(("Funder", fetch_funders))
 
-        if referenced_work_ids and not skip_referenced:
+        if referenced_work_ids:
             def fetch_referenced():
                 entities = self.openalex.fetch_works_by_ids(list(referenced_work_ids))
                 # Use _save_works_batch for Work to include relationship fields
@@ -476,12 +529,9 @@ class OpenAlexImporter:
         item.current_timestamp. These are not added by to_node_dict() so we
         inject them here.
         """
-        if not self.current_session:
-            return
         ts = timestamp or datetime.now().isoformat()
         for node in nodes:
-            node["current_session"] = self.current_session
-            node["current_timestamp"] = ts
+            self._attach_import_metadata(node, ts)
 
     def _import_nodes(self) -> dict[str, int]:
         """Import all collected nodes to Neo4j.
@@ -610,9 +660,7 @@ class OpenAlexImporter:
             for node in nodes:
                 clean = {k: v for k, v in node.items()
                          if k not in self._REL_FIELDS}
-                if "current_session" not in clean:
-                    clean["current_session"] = self.current_session
-                    clean["current_timestamp"] = ts
+                self._attach_import_metadata(clean, ts)
                 clean_nodes.append(clean)
             counts[count_key] = self.neo4j.batch_create_nodes(
                 label, clean_nodes, dynamic_label=dynamic,
@@ -884,9 +932,7 @@ class OpenAlexImporter:
                 ids_for_relations.add(node["id"])
                 clean = {k: v for k, v in node.items()
                          if k not in self._REL_FIELDS}
-                if "current_session" not in clean:
-                    clean["current_session"] = self.current_session
-                    clean["current_timestamp"] = ts
+                self._attach_import_metadata(clean, ts)
                 clean_nodes.append(clean)
 
             # Write to Neo4j
@@ -1011,7 +1057,12 @@ class OpenAlexImporter:
 
         return counts
 
-    def import_from_cache(self, session_id: str, cache_dir: str | Path) -> dict[str, int]:
+    def import_from_cache(
+        self,
+        session_id: str,
+        cache_dir: str | Path,
+        node_tags: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, int]:
         """Resume import from an existing JSONL cache (skip API fetch).
 
         Args:
@@ -1023,6 +1074,7 @@ class OpenAlexImporter:
         """
         from .serializer import DataSerializer
 
+        self.node_tags = self._normalize_tags(node_tags)
         cache_root = Path(cache_dir) if cache_dir else Path.home() / ".openalex-neo4j" / "cache"
         self.serializer = DataSerializer(cache_root, session_id)
         self.current_session = session_id
@@ -1032,6 +1084,10 @@ class OpenAlexImporter:
             raise ValueError(f"Cache for session {session_id} not found at {self.serializer.data_dir}")
 
         generate_embeddings = manifest.get("parameters", {}).get("generate_embeddings", False)
+        if not self.node_tags:
+            self.node_tags = self._normalize_tags(
+                manifest.get("parameters", {}).get("node_tags", []),
+            )
 
         self.neo4j.create_constraints()
         self.neo4j.create_indexes(include_vector=generate_embeddings)

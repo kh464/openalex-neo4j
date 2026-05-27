@@ -198,6 +198,7 @@ class TestBatchCreateNodesWithSession:
             "current_session": "S1",
             "current_timestamp": "2026-01-01T00:00:00",
             "import_sessions": ["S1"],
+            "import_tags": ["batch-a"],
         }]
         client_with_session.batch_create_nodes("Work", nodes, current_session="S1")
 
@@ -208,6 +209,7 @@ class TestBatchCreateNodesWithSession:
         assert "ON CREATE SET" in query
         assert "ON MATCH SET" in query
         assert "import_sessions" in query
+        assert "import_tags" in query
         assert "last_imported_at" in query
 
     def test_session_query_with_dynamic_label(self, client_with_session, mock_session):
@@ -219,6 +221,7 @@ class TestBatchCreateNodesWithSession:
             "current_session": "S1",
             "current_timestamp": "2026-01-01T00:00:00",
             "import_sessions": ["S1"],
+            "import_tags": ["batch-a"],
         }]
         client_with_session.batch_create_nodes("Work", nodes, dynamic_label=True, current_session="S1")
 
@@ -228,13 +231,14 @@ class TestBatchCreateNodesWithSession:
 
     def test_no_session_original_behavior(self, client_with_session, mock_session):
         """Test that without current_session, original query is used."""
-        nodes = [{"id": "W1", "title": "Test"}]
+        nodes = [{"id": "W1", "title": "Test", "import_tags": ["batch-a"]}]
         client_with_session.batch_create_nodes("Work", nodes)
 
         call_args = mock_session.run.call_args
         query = call_args[0][0]
         assert "ON CREATE SET" not in query
         assert "SET n += item" in query or "SET n:$(item._label)" in query
+        assert "import_tags" in query
 
     def test_empty_nodes(self, client_with_session):
         """Test with empty nodes list."""

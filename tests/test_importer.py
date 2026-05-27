@@ -152,7 +152,7 @@ class TestOpenAlexImporter:
         # Should create multiple relationship types
         assert mock_neo4j_client.batch_create_relationships.call_count >= 1
 
-    def test_import_from_query(self, importer, mock_openalex_client, mock_neo4j_client):
+    def test_import_from_query(self, importer, mock_openalex_client, mock_neo4j_client, tmp_path):
         """Test full import workflow."""
         # Mock initial search
         initial_work = Work(
@@ -167,12 +167,37 @@ class TestOpenAlexImporter:
             Author(id="A1", display_name="Author")
         ]
 
-        counts = importer.import_from_query("test query", limit=10, expand_depth=1)
+        counts = importer.import_from_query(
+            "test query", limit=10, expand_depth=1, cache_dir=tmp_path,
+        )
 
         # Check workflow
-        mock_openalex_client.search_works.assert_called_once_with("test query", 10, from_year=None, to_year=None)
+        mock_openalex_client.search_works.assert_called_once_with(
+            "test query", 10, from_year=None, to_year=None, work_types=[],
+        )
         mock_neo4j_client.create_constraints.assert_called_once()
         assert isinstance(counts, dict)
+
+    def test_import_from_query_filters_by_work_type(
+        self, importer, mock_openalex_client, mock_neo4j_client, tmp_path
+    ):
+        """Work type filters are normalized, passed to OpenAlex, and written to manifest."""
+        mock_openalex_client.search_works.return_value = []
+
+        importer.import_from_query(
+            "test query",
+            limit=10,
+            work_types=["Article", "review", "article", " "],
+            cache_dir=tmp_path,
+            keep_cache=True,
+        )
+
+        mock_openalex_client.search_works.assert_called_once_with(
+            "test query", 10, from_year=None, to_year=None,
+            work_types=["article", "review"],
+        )
+        manifest = importer.serializer.read_manifest()
+        assert manifest["parameters"]["work_types"] == ["article", "review"]
 
     def test_import_from_query_multiple_depths(
         self, importer, mock_openalex_client, mock_neo4j_client, tmp_path
@@ -280,25 +305,29 @@ class TestImporterSessionTracking:
     def importer_with_session(self, mock_neo4j_client, mock_openalex_client, mock_session_manager):
         return OpenAlexImporter(mock_neo4j_client, mock_openalex_client, mock_session_manager)
 
-    def test_session_created_on_import(self, importer_with_session, mock_session_manager, mock_openalex_client):
+    def test_session_created_on_import(
+        self, importer_with_session, mock_session_manager, mock_openalex_client, tmp_path,
+    ):
         """Test that a session is created when importing."""
         mock_openalex_client.search_works.return_value = [
             Work(id="W1", title="Test Paper"),
         ]
 
-        importer_with_session.import_from_query("test query", limit=1)
+        importer_with_session.import_from_query("test query", limit=1, cache_dir=tmp_path)
 
         mock_session_manager.create_session.assert_called_once_with(
             query="test query", limit=1, expand_depth=1, tag=None,
         )
 
-    def test_session_completed_after_import(self, importer_with_session, mock_session_manager, mock_openalex_client):
+    def test_session_completed_after_import(
+        self, importer_with_session, mock_session_manager, mock_openalex_client, tmp_path,
+    ):
         """Test that session is marked completed after import."""
         mock_openalex_client.search_works.return_value = [
             Work(id="W1", title="Test Paper"),
         ]
 
-        counts = importer_with_session.import_from_query("test", limit=1)
+        counts = importer_with_session.import_from_query("test", limit=1, cache_dir=tmp_path)
 
         mock_session_manager.complete_session.assert_called_once()
         args, kwargs = mock_session_manager.complete_session.call_args
@@ -311,23 +340,30 @@ class TestImporterSessionTracking:
         assert importer.session_manager is None
         assert importer.current_session is None
 
-    def test_to_node_dict_called_with_session(self, importer_with_session, mock_session_manager, mock_openalex_client, mock_neo4j_client):
+    def test_to_node_dict_called_with_session(
+        self, importer_with_session, mock_session_manager, mock_openalex_client,
+        mock_neo4j_client, tmp_path,
+    ):
         """Test that to_node_dict is called with current_session."""
         mock_openalex_client.search_works.return_value = [
             Work(id="W1", title="Test"),
         ]
 
-        importer_with_session.import_from_query("test", limit=1)
+        importer_with_session.import_from_query("test", limit=1, cache_dir=tmp_path)
 
         # Verify batch_create_nodes was called with current_session
         calls = mock_neo4j_client.batch_create_nodes.call_args_list
         work_call = [c for c in calls if c[0][0] == "Work"]
         assert len(work_call) > 0
 
-    def test_session_tag_passed_to_manager(self, importer_with_session, mock_session_manager, mock_openalex_client):
+    def test_session_tag_passed_to_manager(
+        self, importer_with_session, mock_session_manager, mock_openalex_client, tmp_path,
+    ):
         """Test that tag is passed to session manager."""
         mock_openalex_client.search_works.return_value = []
-        importer_with_session.import_from_query("test", limit=1, tag="my-import")
+        importer_with_session.import_from_query(
+            "test", limit=1, tag="my-import", cache_dir=tmp_path,
+        )
 
         mock_session_manager.create_session.assert_called_with(
             query="test", limit=1, expand_depth=1, tag="my-import",
@@ -432,11 +468,11 @@ class TestCacheBackedImport:
 
         sid = "test_resume"
         serializer = DataSerializer(tmp_path, sid)
-        serializer.append("Work", {"id": "W1", "title": "Resumed"})
+        serializer.append("Work", {"id": "W1", "title": "Resumed", "import_tags": ["batch-a"]})
         serializer.write_manifest({
             "session_id": sid,
             "query": "test",
-            "parameters": {"generate_embeddings": False},
+            "parameters": {"generate_embeddings": False, "node_tags": ["batch-a"]},
         })
 
         importer = OpenAlexImporter(mock_neo4j_client, mock_openalex)
@@ -444,6 +480,7 @@ class TestCacheBackedImport:
         assert "works" in counts
         assert mock_neo4j_client.batch_create_nodes.called
         assert mock_neo4j_client.create_constraints.called
+        assert importer.node_tags == ["batch-a"]
 
     def test_import_from_cache_with_embeddings(self, mock_neo4j_client, mock_openalex, tmp_path):
         """import_from_cache creates vector index when manifest says so."""
@@ -466,6 +503,7 @@ class TestCacheBackedImport:
 
         importer = OpenAlexImporter(mock_neo4j_client, Mock())
         importer.current_session = "S_test"
+        importer.node_tags = ["batch-a"]
         importer.serializer = DataSerializer(tmp_path, "S_test")
 
         work = Work(id="W1", title="Test", author_ids=["A1"],
@@ -477,34 +515,48 @@ class TestCacheBackedImport:
         assert "author_ids" in cached[0]
         assert cached[0]["author_ids"] == ["A1"]
         assert cached[0]["referenced_work_ids"] == ["W2"]
+        assert cached[0]["import_tags"] == ["batch-a"]
 
 
 class TestLargeImportOptimization:
-    """Tests for large import optimization features."""
+    """Tests for relationship expansion behavior."""
 
-    def test_large_import_auto_limits_depth(self, mock_neo4j_client, mock_openalex_client, tmp_path):
-        """Limit > LARGE_IMPORT_THRESHOLD forces expand_depth to 1."""
+    def test_large_import_keeps_requested_expand_depth(
+        self, mock_neo4j_client, mock_openalex_client, tmp_path
+    ):
+        """Large imports keep the requested depth instead of forcing depth=1."""
         importer = OpenAlexImporter(mock_neo4j_client, mock_openalex_client)
-        importer.current_session = "S_large"
+        importer.current_session = "S_large_depth"
         from openalex_neo4j.serializer import DataSerializer
-        importer.serializer = DataSerializer(tmp_path, "S_large")
+        importer.serializer = DataSerializer(tmp_path, "S_large_depth")
 
-        # Mock search_works to return nothing (we only test the depth logic)
-        mock_openalex_client.search_works.return_value = []
+        work1 = Work(id="W1", title="Paper", referenced_work_ids=["W2"])
+        work2 = Work(id="W2", title="Cited A", referenced_work_ids=["W3"])
+        work3 = Work(id="W3", title="Cited B")
 
-        # Large import with expand_depth=3
+        mock_openalex_client.search_works.return_value = [work1]
+
+        def fetch_works_side_effect(ids):
+            if "W2" in ids:
+                return [work2]
+            if "W3" in ids:
+                return [work3]
+            return []
+
+        mock_openalex_client.fetch_works_by_ids.side_effect = fetch_works_side_effect
+
         importer.import_from_query(
-            "test", limit=10000, expand_depth=3,
+            "test", limit=10000, expand_depth=2,
             cache_dir=tmp_path, keep_cache=True,
         )
 
-        # The expand loop should only run once (depth forced to 1)
-        # _expand_and_save_relationships should be called exactly once
-        # We verify this via the work count written
-        # Since search_works returned [], expand won't fetch anything
+        assert mock_openalex_client.fetch_works_by_ids.call_count == 2
+        cached = importer.serializer.read("Work")
+        cached_ids = {w["id"] for w in cached}
+        assert cached_ids == {"W1", "W2", "W3"}
 
-    def test_small_import_no_restriction(self, mock_neo4j_client, mock_openalex_client, tmp_path):
-        """Limit <= LARGE_IMPORT_THRESHOLD does not restrict anything."""
+    def test_import_fetches_referenced_works(self, mock_neo4j_client, mock_openalex_client, tmp_path):
+        """Referenced works are expanded when expand_depth=1."""
         importer = OpenAlexImporter(mock_neo4j_client, mock_openalex_client)
         importer.current_session = "S_small"
         from openalex_neo4j.serializer import DataSerializer
@@ -529,30 +581,59 @@ class TestLargeImportOptimization:
         assert "W2" in cached_ids
         assert "W3" in cached_ids
 
-    def test_large_import_skips_referenced_works(self, mock_neo4j_client, mock_openalex_client, tmp_path):
-        """Large import does not fetch referenced works."""
+    def test_large_import_still_fetches_referenced_works(
+        self, mock_neo4j_client, mock_openalex_client, tmp_path
+    ):
+        """Large imports no longer skip referenced works."""
         importer = OpenAlexImporter(mock_neo4j_client, mock_openalex_client)
         importer.current_session = "S_large_skip"
         from openalex_neo4j.serializer import DataSerializer
         importer.serializer = DataSerializer(tmp_path, "S_large_skip")
 
         work1 = Work(id="W1", title="Paper", referenced_work_ids=["W2", "W3"])
+        work2 = Work(id="W2", title="Cited A")
+        work3 = Work(id="W3", title="Cited B")
 
         mock_openalex_client.search_works.return_value = [work1]
-        mock_openalex_client.fetch_works_by_ids.return_value = []
+        mock_openalex_client.fetch_works_by_ids.return_value = [work2, work3]
 
         importer.import_from_query(
             "test", limit=10000, expand_depth=1,
             cache_dir=tmp_path, keep_cache=True,
         )
 
-        # fetch_works_by_ids should NOT have been called
-        mock_openalex_client.fetch_works_by_ids.assert_not_called()
+        mock_openalex_client.fetch_works_by_ids.assert_called_once()
 
-        # Only W1 in cache
         cached = importer.serializer.read("Work")
-        assert len(cached) == 1
-        assert cached[0]["id"] == "W1"
+        cached_ids = {w["id"] for w in cached}
+        assert "W1" in cached_ids
+        assert "W2" in cached_ids
+        assert "W3" in cached_ids
+
+    def test_unbounded_import_keeps_reference_expansion(
+        self, mock_neo4j_client, mock_openalex_client, tmp_path
+    ):
+        """limit=None still expands referenced works."""
+        importer = OpenAlexImporter(mock_neo4j_client, mock_openalex_client)
+        importer.current_session = "S_unbounded"
+        from openalex_neo4j.serializer import DataSerializer
+        importer.serializer = DataSerializer(tmp_path, "S_unbounded")
+
+        work1 = Work(id="W1", title="Paper", referenced_work_ids=["W2"])
+        work2 = Work(id="W2", title="Cited A")
+
+        mock_openalex_client.search_works.return_value = [work1]
+        mock_openalex_client.fetch_works_by_ids.return_value = [work2]
+
+        importer.import_from_query(
+            "test", limit=None, expand_depth=1,
+            cache_dir=tmp_path, keep_cache=True,
+        )
+
+        mock_openalex_client.fetch_works_by_ids.assert_called_once()
+        cached = importer.serializer.read("Work")
+        cached_ids = {w["id"] for w in cached}
+        assert cached_ids == {"W1", "W2"}
 
     def test_import_nodes_streaming(self, mock_neo4j_client, mock_openalex_client):
         """_import_nodes_streaming creates nodes and returns entity IDs."""

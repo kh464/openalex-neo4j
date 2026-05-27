@@ -118,6 +118,12 @@ def _common_neo4j_options(f):
     help="Optional tag/alias for this import session",
 )
 @click.option(
+    "--node-tag",
+    "node_tags",
+    multiple=True,
+    help="Custom tag to attach to every imported node (can repeat)",
+)
+@click.option(
     "--skip-constraints",
     is_flag=True,
     help="Skip creating constraints and indexes (faster when Neo4j already set up)",
@@ -144,6 +150,12 @@ def _common_neo4j_options(f):
     type=int,
     default=None,
     help="End publication year (inclusive), e.g. 2024",
+)
+@click.option(
+    "--type",
+    "work_types",
+    multiple=True,
+    help="OpenAlex work type filter, e.g. article or review (can repeat)",
 )
 @click.option(
     "--cache-dir",
@@ -183,11 +195,13 @@ def import_data(
     generate_embeddings: bool,
     verbose: bool,
     tag: str | None,
+    node_tags: tuple[str, ...],
     skip_constraints: bool,
     clean: str,
     quality_report: bool,
     from_year: int | None,
     to_year: int | None,
+    work_types: tuple[str, ...],
     cache_dir: str | None,
     keep_cache: bool,
     resume: str | None,
@@ -266,10 +280,14 @@ def import_data(
         click.echo(f"From year: {from_year}")
     if to_year:
         click.echo(f"To year: {to_year}")
+    if work_types:
+        click.echo(f"Work types: {', '.join(work_types)}")
     click.echo(f"Expand depth: {expand_depth}")
     click.echo(f"Neo4j URI: {neo4j_uri}")
     click.echo(f"Neo4j username: {neo4j_username}")
     click.echo(f"OpenAlex email: {email or '(not set - using anonymous pool)'}")
+    if node_tags:
+        click.echo(f"Node tags: {', '.join(node_tags)}")
     if keep_cache:
         click.echo(f"Cache: {_get_cache_root()} (keep)")
     else:
@@ -291,9 +309,11 @@ def import_data(
                 tag=tag,
                 from_year=from_year,
                 to_year=to_year,
+                work_types=list(work_types),
                 cache_dir=_get_cache_root(),
                 keep_cache=True,
                 fetch_only=True,
+                node_tags=list(node_tags),
             )
             click.echo()
             click.echo("=" * 70)
@@ -329,6 +349,7 @@ def import_data(
             counts = importer.import_from_cache(
                 resume,
                 _get_cache_root(),
+                node_tags=list(node_tags),
             )
             click.echo(f"Resumed import from cache session: {resume}")
             # Skip quality check for resumed imports — the cache dicts are
@@ -345,8 +366,10 @@ def import_data(
             skip_constraints=skip_constraints,
             from_year=from_year,
             to_year=to_year,
+            work_types=list(work_types),
             cache_dir=_get_cache_root(),
             keep_cache=keep_cache,
+            node_tags=list(node_tags),
         )
 
         # Quality check and cleaning
@@ -478,11 +501,23 @@ def import_data(
     help="Filter: end publication year (inclusive)",
 )
 @click.option(
+    "--type",
+    "work_types",
+    multiple=True,
+    help="OpenAlex work type filter, e.g. article or review (can repeat)",
+)
+@click.option(
     "--email",
     default=lambda: os.getenv("OPENALEX_EMAIL"),
     help="Email for OpenAlex polite pool (env: OPENALEX_EMAIL)",
 )
-def count_command(query: str, from_year: int | None, to_year: int | None, email: str | None) -> None:
+def count_command(
+    query: str,
+    from_year: int | None,
+    to_year: int | None,
+    work_types: tuple[str, ...],
+    email: str | None,
+) -> None:
     """Count how many works match a search query in OpenAlex.
 
     Makes a single API call and displays the total count without
@@ -490,7 +525,9 @@ def count_command(query: str, from_year: int | None, to_year: int | None, email:
     """
     try:
         client = OpenAlexClient(email, rate_limiter=TokenBucket())
-        total = client.count_works(query, from_year=from_year, to_year=to_year)
+        total = client.count_works(
+            query, from_year=from_year, to_year=to_year, work_types=list(work_types),
+        )
 
         click.echo("=" * 70)
         click.echo("OpenAlex Query Count")
@@ -500,6 +537,8 @@ def count_command(query: str, from_year: int | None, to_year: int | None, email:
             click.echo(f"  From:     {from_year}")
         if to_year:
             click.echo(f"  To:       {to_year}")
+        if work_types:
+            click.echo(f"  Types:    {', '.join(work_types)}")
         click.echo(f"  Matching: {total:,}")
         click.echo("=" * 70)
     except Exception as e:
@@ -733,6 +772,49 @@ def stats_command(neo4j_uri, neo4j_username, neo4j_password):
 
     click.echo("=" * 70)
     neo4j_client.close()
+
+
+# ---------------------------------------------------------------------------
+# export command
+# ---------------------------------------------------------------------------
+
+@cli.command(name="export")
+@_common_neo4j_options
+@click.option("--node-tag", required=True, help="Export only nodes containing this import tag")
+@click.option("--label", "labels", multiple=True, help="Restrict export to one or more labels")
+@click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path),
+              help="Output JSONL file path")
+def export_command(neo4j_uri, neo4j_username, neo4j_password, node_tag, labels, output):
+    """Export tagged Neo4j nodes to a JSONL file."""
+    if not neo4j_password:
+        click.echo("Error: Neo4j password is required", err=True)
+        sys.exit(1)
+
+    neo4j_client = _get_neo4j_client(neo4j_uri, neo4j_username, neo4j_password)
+
+    query = """
+        MATCH (n)
+        WHERE $node_tag IN coalesce(n.import_tags, [])
+          AND ($labels = [] OR any(label IN labels(n) WHERE label IN $labels))
+        RETURN labels(n) as labels, properties(n) as props
+        ORDER BY coalesce(n.id, ''), head(labels(n))
+    """
+
+    exported = 0
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with neo4j_client.driver.session() as session:
+            result = session.run(query, node_tag=node_tag, labels=list(labels))
+            with output.open("w", encoding="utf-8") as f:
+                for record in result:
+                    row = dict(record["props"])
+                    row["_labels"] = record["labels"]
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    exported += 1
+    finally:
+        neo4j_client.close()
+
+    click.echo(f"Exported {exported} nodes to {output}")
 
 
 # ---------------------------------------------------------------------------

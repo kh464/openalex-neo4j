@@ -46,6 +46,10 @@ class TestOpenAlexClient:
             assert len(works) == 1
             assert works[0].id == "W123"
             assert works[0].title == "Test Paper"
+            mock_works.return_value.search.return_value.paginate.assert_called_once_with(
+                per_page=10,
+                n_max=10,
+            )
 
     def test_search_works_respects_limit(self, client):
         """Test that search respects the limit parameter."""
@@ -65,6 +69,45 @@ class TestOpenAlexClient:
             # Should stop at 3, not fetch all 10
             assert len(works) <= 3
 
+    def test_search_works_without_limit_disables_default_max(self, client):
+        """search_works passes n_max=None so PyAlex does not stop at 10,000."""
+        mock_work_data = {
+            "id": "https://openalex.org/W123",
+            "title": "Test Paper",
+        }
+
+        with patch("openalex_neo4j.openalex_client.Works") as mock_works:
+            mock_works.return_value.search.return_value.paginate.return_value = [[mock_work_data]]
+
+            works = client.search_works("test query", limit=None)
+
+            assert len(works) == 1
+            mock_works.return_value.search.return_value.paginate.assert_called_once_with(
+                per_page=200,
+                n_max=None,
+            )
+
+    def test_search_works_filters_by_type(self, client):
+        """search_works applies repeated work types as an OpenAlex OR filter."""
+        mock_work_data = {
+            "id": "https://openalex.org/W123",
+            "title": "Test Paper",
+        }
+
+        with patch("openalex_neo4j.openalex_client.Works") as mock_works:
+            search_request = mock_works.return_value.search.return_value
+            type_request = Mock()
+            search_request.filter.return_value = type_request
+            type_request.paginate.return_value = [[mock_work_data]]
+
+            works = client.search_works(
+                "test query", limit=10, work_types=["article", "review"],
+            )
+
+            assert len(works) == 1
+            search_request.filter.assert_called_once_with(type="article|review")
+            type_request.paginate.assert_called_once_with(per_page=10, n_max=10)
+
     def test_search_works_handles_errors(self, client):
         """Test that search handles errors gracefully."""
         with patch("openalex_neo4j.openalex_client.Works") as mock_works:
@@ -74,6 +117,20 @@ class TestOpenAlexClient:
 
             # Should return empty list on error
             assert works == []
+
+    def test_count_works_filters_by_type(self, client):
+        """count_works applies repeated work types as an OpenAlex OR filter."""
+        with patch("openalex_neo4j.openalex_client.Works") as mock_works:
+            search_request = mock_works.return_value.search.return_value
+            type_request = Mock()
+            type_request.get.return_value.meta = {"count": 42}
+            search_request.filter.return_value = type_request
+
+            count = client.count_works("test query", work_types=["article", "review"])
+
+            assert count == 42
+            search_request.filter.assert_called_once_with(type="article|review")
+            type_request.get.assert_called_once()
 
     def test_fetch_works_by_ids(self, client):
         """Test fetching works by IDs."""
