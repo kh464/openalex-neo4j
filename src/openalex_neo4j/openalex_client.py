@@ -1,6 +1,7 @@
 """OpenAlex client for fetching scholarly data."""
 
 import logging
+import time
 from typing import Any
 
 import pyalex
@@ -53,18 +54,84 @@ class OpenAlexClient:
 
         for i in range(0, len(ids), batch_size):
             batch_ids = ids[i:i + batch_size]
-            filter_str = "|".join(f"https://openalex.org/{entity_id}" for entity_id in batch_ids)
-            request = entity_cls().filter(**{filter_field: filter_str})
-
-            # OpenAlex list endpoints default to 25 rows, so iterate with an
-            # explicit per_page/n_max equal to the batch size to avoid silently
-            # dropping half the requested IDs in 50-ID OR filters.
-            pager = request.paginate(per_page=len(batch_ids), n_max=len(batch_ids))
-            for page in pager:
-                self._rate_limit()
-                results.extend(page)
+            results.extend(
+                self._fetch_openalex_batch(
+                    entity_cls,
+                    batch_ids,
+                    filter_field=filter_field,
+                )
+            )
 
         return results
+
+    def _fetch_openalex_batch(
+        self,
+        entity_cls: Any,
+        batch_ids: list[str],
+        *,
+        filter_field: str = "openalex_id",
+        max_retries: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Fetch one ID batch, retrying and splitting when requests are flaky."""
+        filter_str = "|".join(f"https://openalex.org/{entity_id}" for entity_id in batch_ids)
+        batch_len = len(batch_ids)
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                request = entity_cls().filter(**{filter_field: filter_str})
+
+                # OpenAlex list endpoints default to 25 rows, so iterate with an
+                # explicit per_page/n_max equal to the batch size to avoid silently
+                # dropping half the requested IDs in OR filters.
+                pager = request.paginate(per_page=batch_len, n_max=batch_len)
+                results: list[dict[str, Any]] = []
+                for page in pager:
+                    self._rate_limit()
+                    results.extend(page)
+                return results
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(
+                        "Retrying %s batch of %s IDs after error (%s/%s): %s",
+                        getattr(entity_cls, "__name__", str(entity_cls)),
+                        batch_len,
+                        attempt,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(0.5 * attempt)
+
+        if batch_len > 1:
+            midpoint = batch_len // 2
+            logger.warning(
+                "Splitting %s batch of %s IDs after repeated errors: %s",
+                getattr(entity_cls, "__name__", str(entity_cls)),
+                batch_len,
+                last_error,
+            )
+            left = self._fetch_openalex_batch(
+                entity_cls,
+                batch_ids[:midpoint],
+                filter_field=filter_field,
+                max_retries=max_retries,
+            )
+            right = self._fetch_openalex_batch(
+                entity_cls,
+                batch_ids[midpoint:],
+                filter_field=filter_field,
+                max_retries=max_retries,
+            )
+            return left + right
+
+        logger.error(
+            "Failed to fetch %s ID %s after retries: %s",
+            getattr(entity_cls, "__name__", str(entity_cls)),
+            batch_ids[0],
+            last_error,
+        )
+        return []
 
     @staticmethod
     def _normalize_work_types(work_types: list[str] | tuple[str, ...] | None) -> list[str]:

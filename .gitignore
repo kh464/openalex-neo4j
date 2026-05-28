@@ -131,3 +131,6 @@ dmypy.json
 
 # Neo4j
 neo4j/
+
+
+paper*/

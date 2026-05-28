@@ -276,3 +276,29 @@ class TestOpenAlexClient:
                 per_page=50,
                 n_max=50,
             )
+
+    def test_fetch_works_by_ids_splits_batch_after_retries(self, client):
+        """A failing 50-ID batch is retried, then split into smaller successful batches."""
+        work_ids = [f"W{i}" for i in range(50)]
+
+        def paginate_side_effect(*, per_page, n_max):
+            if per_page == 50:
+                raise Exception("proxy disconnected")
+            return [[{
+                "id": f"https://openalex.org/{work_ids[0]}",
+                "title": "Recovered Work",
+            }]]
+
+        with patch("openalex_neo4j.openalex_client.Works") as mock_works:
+            mock_works.return_value.filter.return_value.paginate.side_effect = paginate_side_effect
+
+            works = client.fetch_works_by_ids(work_ids)
+
+            assert len(works) == 2
+            paginate_calls = mock_works.return_value.filter.return_value.paginate.call_args_list
+            assert len(paginate_calls) == 5
+            assert paginate_calls[0].kwargs == {"per_page": 50, "n_max": 50}
+            assert paginate_calls[1].kwargs == {"per_page": 50, "n_max": 50}
+            assert paginate_calls[2].kwargs == {"per_page": 50, "n_max": 50}
+            assert paginate_calls[3].kwargs == {"per_page": 25, "n_max": 25}
+            assert paginate_calls[4].kwargs == {"per_page": 25, "n_max": 25}
